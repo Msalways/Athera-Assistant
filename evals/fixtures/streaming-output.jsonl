@@ -1,0 +1,1 @@
+{"input":"Stream the fixture response.","fast":[{"type":"respond","text":"Streaming works."}],"fast_events":[[{"type":"text_delta","text":"Streaming "},{"type":"text_delta","text":"works."}]],"cloud":[]}

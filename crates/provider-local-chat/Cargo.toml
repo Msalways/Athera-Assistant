@@ -1,0 +1,19 @@
+[package]
+name = "provider-local-chat"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[features]
+native-ffi = []
+
+[dependencies]
+assistant-contracts = { path = "../contracts" }
+async-trait.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+sha2 = "0.10"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process"] }
+
+[lints.rust]
+unsafe_code = "deny"

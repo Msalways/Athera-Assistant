@@ -1,0 +1,22 @@
+{
+  "name": "assistant-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/mobile"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:ui": "npm run dev -w apps/mobile",
+    "build": "npm run build -w apps/mobile",
+    "build:sms": "npm run build:sms -w apps/mobile",
+    "lint": "npm run lint -w apps/mobile",
+    "test": "node --test scripts/dev.test.mjs && npm run test -w apps/mobile",
+    "format": "prettier --write apps/mobile/src apps/mobile/*.json apps/mobile/*.ts scripts/*.mjs",
+    "format:check": "prettier --check apps/mobile/src apps/mobile/*.json apps/mobile/*.ts scripts/*.mjs",
+    "tauri": "npm run tauri -w apps/mobile"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}

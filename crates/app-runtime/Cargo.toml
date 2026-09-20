@@ -1,0 +1,24 @@
+[package]
+name = "app-runtime"
+version.workspace = true
+edition.workspace = true
+
+[features]
+native-local-chat = ["provider-local-chat/native-ffi"]
+
+[dependencies]
+assistant-contracts.workspace = true
+assistant-core.workspace = true
+storage-sqlite.workspace = true
+provider-cloud.workspace = true
+provider-needle.workspace = true
+provider-local-chat.workspace = true
+adapter-mcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+
+[lints]
+workspace = true

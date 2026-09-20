@@ -1,0 +1,18 @@
+[package]
+name = "assistant-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+assistant-contracts.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+jsonschema.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+storage-sqlite.workspace = true
+
+[lints]
+workspace = true

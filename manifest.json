@@ -1,0 +1,41 @@
+{
+  "app_name": "AETHRA",
+  "expansion": "Adaptive Edge Task & Hybrid Reasoning Assistant",
+  "display_name": "Aethra",
+  "target": "Android-first Tauri 2 + Rust + React/TypeScript",
+  "fast_router": "Needle",
+  "cloud_models": [
+    "OpenAI",
+    "OpenAI-compatible (including NVIDIA NIM)"
+  ],
+  "tool_bus": "MCP",
+  "initial_oauth_integration": "Composio",
+  "storage": "SQLite",
+  "evaluation": [
+    "DeepEval",
+    "deterministic Rust/TS tests",
+    "Maestro"
+  ],
+  "files": [
+    "AGENTS.md",
+    "README.md",
+    "codex-prompts/01-foundation.md",
+    "codex-prompts/02-mobile-ui.md",
+    "codex-prompts/03-agent-core.md",
+    "codex-prompts/04-needle-runtime.md",
+    "codex-prompts/05-cloud-models.md",
+    "codex-prompts/06-mcp-auth.md",
+    "codex-prompts/07-context-storage.md",
+    "codex-prompts/08-evals.md",
+    "dev/codex-skills/README.md",
+    "docs/CAPABILITY_ROUTING.md",
+    "docs/CODEX_SKILLS_REQUIRED.md",
+    "docs/EVAL_STRATEGY.md",
+    "docs/MASTER_BUILD_PLAN.md",
+    "docs/MCP_OAUTH_SECURITY.md",
+    "docs/MOBILE_UI_AND_CONFIGURATION.md",
+    "docs/NAMING.md",
+    "docs/NEEDLE_ANDROID.md",
+    "docs/PARALLEL_EXECUTION.md"
+  ]
+}

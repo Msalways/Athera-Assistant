@@ -1,0 +1,2 @@
+#!/usr/bin/env node
+import "file:///C:/Users/shant/Music/Athera-Assistant/node_modules/@tauri-apps/cli/tauri.js";

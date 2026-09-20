@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AETHRA evaluation case v1",
+  "type": "object",
+  "required": ["case_id", "profile", "verification", "input"],
+  "properties": {
+    "case_id": {"type": "string", "minLength": 1},
+    "profile": {"type": "string", "minLength": 1},
+    "verification": {"enum": ["exact", "judge", "both", "physical"]},
+    "input": {"type": "string"},
+    "expected": {"type": "object"},
+    "capabilities": {"type": "array"},
+    "skills": {"type": "array"},
+    "fault_schedule": {"type": "array"}
+  },
+  "additionalProperties": true
+}

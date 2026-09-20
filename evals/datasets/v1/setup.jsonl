@@ -1,0 +1,1 @@
+{"case_id":"vs00-deepeval-real-runner","profile":"fixture","verification":"exact","input":"Echo the deterministic setup value.","expected":{"result":"pass","status":"completed","tool_id":"fixture.echo","arguments":{"text":"setup"}}}

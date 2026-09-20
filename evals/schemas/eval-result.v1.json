@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AETHRA redacted evaluation result v1",
+  "type": "object",
+  "required": ["schema_version", "outcome", "profile", "redaction_version"],
+  "properties": {
+    "schema_version": {"const": "v1"},
+    "case_id": {"type": ["string", "null"]},
+    "run_id": {"type": "string"},
+    "outcome": {"enum": ["passed", "failed", "blocked", "needs_review"]},
+    "blocked_reason": {"type": ["string", "null"]},
+    "profile": {"type": "string"},
+    "redaction_version": {"const": "v1"},
+    "trace": {"type": ["object", "null"]},
+    "runtime": {"type": "object"}
+  },
+  "additionalProperties": true
+}

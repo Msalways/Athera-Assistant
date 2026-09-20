@@ -1,0 +1,13 @@
+[package]
+name = "storage-sqlite"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+assistant-contracts.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+rusqlite.workspace = true
+
+[lints]
+workspace = true

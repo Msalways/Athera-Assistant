@@ -1,0 +1,21 @@
+[package]
+name = "provider-needle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+assistant-contracts.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+libloading = "0.8"
+tokio.workspace = true
+sha2 = "0.10"
+
+[features]
+native-static = []
+
+[build-dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+assistant-core.workspace = true

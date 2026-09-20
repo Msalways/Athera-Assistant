@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/contracts", "crates/assistant-core", "crates/storage-sqlite", "crates/provider-cloud", "crates/provider-needle", "crates/provider-local-chat", "crates/adapter-mcp", "crates/app-runtime", "crates/assistant-cli"]
+exclude = ["apps/mobile/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+assistant-contracts = { path = "crates/contracts" }
+assistant-core = { path = "crates/assistant-core" }
+storage-sqlite = { path = "crates/storage-sqlite" }
+provider-cloud = { path = "crates/provider-cloud" }
+provider-needle = { path = "crates/provider-needle" }
+provider-local-chat = { path = "crates/provider-local-chat" }
+adapter-mcp = { path = "crates/adapter-mcp" }
+app-runtime = { path = "crates/app-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+jsonschema = { version = "0.29", default-features = false }
+httpdate = "1"
+base64 = "0.22"
+getrandom = "0.4"
+sha2 = "0.10"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

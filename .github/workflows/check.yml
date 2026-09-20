@@ -1,0 +1,63 @@
+name: Checks
+on: [push, pull_request]
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+  eval-dataset-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s evals/tests -v
+      - run: python -m evals.lint_datasets
+  eval-deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: evals/requirements-eval.txt
+      - run: python -m pip install -r evals/requirements-eval.txt
+      - run: cargo build -p assistant-cli --bins
+      - name: Run every scripted fixture through the real Rust runner
+        shell: bash
+        run: |
+          for fixture in evals/fixtures/*.jsonl; do
+            target/debug/assistant-cli < "$fixture"
+          done
+      - name: Verify JSON-lines and browser bridge event parity
+        run: python -m evals.verify_bridge_parity target/debug/assistant-cli target/debug/assistant-dev evals/fixtures/streaming-output.jsonl
+      - name: Run offline DeepEval smoke through the real Rust runner
+        env:
+          DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+          PYTHONUTF8: "1"
+          NO_COLOR: "1"
+        run: deepeval test run evals/deepeval_smoke.py

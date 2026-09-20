@@ -1,0 +1,12 @@
+appId: dev.local.assistant
+---
+- launchApp
+- assertVisible: "Assistant"
+- tapOn: "Settings"
+- assertVisible: "Cloud provider"
+- tapOn: "Tools"
+- assertVisible: "No tools found."
+- tapOn: "Skills"
+- assertVisible: "Import skill"
+- tapOn: "Activity"
+- assertVisible: "No tasks yet."

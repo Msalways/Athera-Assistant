@@ -1,0 +1,1 @@
+{"input":"Help plan this task","fast":[{"type":"handoff","role":"planner","objective":"Make a plan","reason":"Needs planning"},{"type":"respond","text":"Finished the planned task"}],"cloud":[{"type":"plan","steps":["Answer the user"]}]}
