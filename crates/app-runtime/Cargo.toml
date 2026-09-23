@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-native-local-chat = ["provider-local-chat/native-ffi"]
+default = []
+local-chat = ["provider-local-chat"]
 
 [dependencies]
 assistant-contracts.workspace = true
@@ -12,7 +13,7 @@ assistant-core.workspace = true
 storage-sqlite.workspace = true
 provider-cloud.workspace = true
 provider-needle.workspace = true
-provider-local-chat.workspace = true
+provider-local-chat = { workspace = true, optional = true }
 adapter-mcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true

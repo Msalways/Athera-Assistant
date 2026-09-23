@@ -15,32 +15,35 @@ const snapshot = {
   voice: "deferred",
 };
 
-it("surfaces missing local model and opens its setup", async () => {
+it("defaults to single assistant mode without requiring an offline model", async () => {
   vi.mocked(command).mockImplementation(async (name) =>
     name === "model_status"
       ? { availability: "missing_model", installation: null, manifest: null }
-      : snapshot,
+      : name === "build_info"
+        ? { git_hash: "test", git_dirty: false, build_timestamp: 0, version: "0.1.0" }
+        : snapshot,
   );
   render(<App />);
-  expect(await screen.findByText("Local model needed")).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Set up local model" }));
+  expect(await screen.findByText("Ready")).toBeVisible();
   expect(
-    await screen.findByRole("heading", { name: "Settings" }),
-  ).toBeVisible();
+    screen.queryByText("Download offline chat model"),
+  ).not.toBeInTheDocument();
 });
 
-it("keeps explicit action requests on submit_input", async () => {
+it("sends requests via submit_input on the single composer", async () => {
   vi.mocked(command).mockImplementation(async (name) =>
     name === "model_status"
       ? { availability: "ready", installation: null, manifest: null }
-      : snapshot,
+      : name === "build_info"
+        ? { git_hash: "test", git_dirty: false, build_timestamp: 0, version: "0.1.0" }
+        : snapshot,
   );
   render(<App />);
-  fireEvent.click(await screen.findByRole("button", { name: "Action" }));
-  fireEvent.change(screen.getByLabelText("Action request"), {
+  await screen.findByText("Ready");
+  fireEvent.change(screen.getByLabelText("Ask Athera"), {
     target: { value: "Send the report" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "Send action" }));
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
   await waitFor(() =>
     expect(command).toHaveBeenCalledWith("submit_input", {
       conversation_id: expect.any(String),

@@ -1,15 +1,51 @@
+#![recursion_limit = "256"]
 //! Vendor-neutral contracts. Credentials and provider SDK objects never belong here.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
+pub mod adaptive;
+pub mod auth;
+pub mod blocker;
+pub mod catalog;
+pub mod catalog_seeds;
+pub mod conformance;
+pub mod connection;
+pub mod connection_test;
 pub mod conversation;
+pub mod credential;
+pub mod credential_metadata;
+pub mod discovery;
 pub mod events;
+pub mod factory;
 pub mod graph;
+pub mod identity;
+pub mod lifecycle;
+pub mod local_response;
+pub mod model;
+pub mod oauth;
 pub mod output;
+pub mod personalization;
 pub mod protocol;
+pub mod provider;
+pub mod provider_health;
+pub mod provider_profile;
+pub mod requirements;
+pub mod router;
+pub mod sigv4;
+pub mod vault;
+pub use blocker::*;
+pub use catalog::*;
+pub use credential_metadata::*;
+pub use model::*;
+pub use personalization::*;
+pub use provider_profile::*;
+pub use requirements::*;
+pub use vault::*;
 pub mod tool_result;
+pub use adaptive::*;
+pub use connection::*;
 pub use events::*;
 pub use graph::*;
 pub use output::*;
@@ -202,6 +238,19 @@ pub enum AgentAction {
     Plan {
         steps: Vec<String>,
     },
+    PlanGraph {
+        proposal: WorkGraphProposal,
+    },
+    /// A model may suggest a preference, but it is always persisted as a
+    /// proposal and requires an explicit user decision before activation.
+    ProposeRule {
+        proposal: RuleProposal,
+    },
+    ProposeSkill {
+        skill: SkillSpec,
+        rationale: String,
+        evidence_id: Id,
+    },
     Handoff {
         role: Role,
         objective: String,
@@ -294,6 +343,9 @@ pub struct ContextBundle {
     pub skills: Vec<SkillSpec>,
     pub candidates: Vec<Candidate>,
     pub tools: Vec<ToolSpec>,
+    /// Enabled, scoped preferences only; never a source of authority or permissions.
+    #[serde(default)]
+    pub adaptive_rules: Vec<AdaptiveRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +367,11 @@ pub type ProviderEventSink = std::sync::Arc<dyn Fn(ProviderEvent) -> Result<()> 
 pub trait ModelProvider: Send + Sync {
     fn id(&self) -> &str;
     fn capabilities(&self) -> ModelCapabilities;
+    /// Whether this provider is ready to accept inference requests on this device.
+    /// Providers that do not need an explicit local runtime are ready by default.
+    fn is_available(&self) -> bool {
+        true
+    }
     async fn infer(&self, context: ContextBundle) -> Result<AgentAction>;
     async fn infer_stream(
         &self,
@@ -331,10 +388,12 @@ pub trait ToolExecutor: Send + Sync {
 }
 
 /// One transaction persists the task snapshot and its monotonically ordered event.
-pub trait Store: Send + Sync {
+pub trait Store: PersonalizationStore + Send + Sync {
     fn save_task(&self, task: &Task) -> Result<()>;
     fn task(&self, id: Uuid) -> Result<Task>;
     fn tasks(&self) -> Result<Vec<Task>>;
+    /// Returns every persisted non-terminal task for deterministic startup recovery.
+    fn unfinished_tasks(&self) -> Result<Vec<Task>>;
     fn save_result(&self, id: Uuid, value: &Value) -> Result<()>;
     fn result(&self, id: Uuid) -> Result<Value>;
     fn put_capability(&self, spec: &Capability) -> Result<()>;
@@ -346,6 +405,46 @@ pub trait Store: Send + Sync {
     fn event_bounds(&self) -> Result<Option<EventBounds>>;
     fn setting(&self, key: &str) -> Result<Option<Value>>;
     fn set_setting(&self, key: &str, value: &Value) -> Result<()>;
+    fn put_adaptive_rule(&self, rule: &AdaptiveRule) -> Result<()>;
+    fn set_adaptive_rule_status(
+        &self,
+        id: Uuid,
+        status: AdaptiveRuleStatus,
+        updated_at: u64,
+    ) -> Result<()>;
+    fn adaptive_rule(&self, id: Uuid) -> Result<AdaptiveRule>;
+    fn adaptive_rules(&self, scope: Option<&RuleScope>, limit: usize) -> Result<Vec<AdaptiveRule>>;
+    fn put_rule_proposal(&self, proposal: &RuleProposal) -> Result<()>;
+    fn rule_proposal(&self, id: Uuid) -> Result<RuleProposal>;
+    fn rule_proposals(
+        &self,
+        status: Option<AdaptiveRuleStatus>,
+        limit: usize,
+    ) -> Result<Vec<RuleProposal>>;
+
+    // Provider profiles (DB-001)
+    fn save_provider_profile(&self, profile: &ProviderProfile) -> Result<()>;
+    fn provider_profile(&self, provider_id: &str) -> Result<Option<ProviderProfile>>;
+    fn provider_profiles(&self) -> Result<Vec<ProviderProfile>>;
+    fn delete_provider_profile(&self, provider_id: &str) -> Result<()>;
+
+    // Credential metadata (DB-002)
+    fn save_credential_metadata(&self, meta: &CredentialMetadata) -> Result<()>;
+    fn credential_metadata(&self, handle: &str) -> Result<Option<CredentialMetadata>>;
+    fn credential_metadata_for_owner(&self, owner_id: &str) -> Result<Vec<CredentialMetadata>>;
+    fn delete_credential_metadata(&self, handle: &str) -> Result<()>;
+    fn delete_all_credential_metadata(&self, owner_id: &str) -> Result<()>;
+
+    // Routing provenance + model usage (DB-005)
+    fn save_routing_provenance(&self, task_id: Id, provenance: &RoutingProvenance) -> Result<()>;
+    fn routing_provenance(&self, task_id: Id) -> Result<Option<RoutingProvenance>>;
+    fn record_model_usage(&self, usage: &StoredModelUsage) -> Result<()>;
+    fn model_usage_for_task(&self, task_id: &str) -> Result<Vec<StoredModelUsage>>;
+
+    // Typed task blockers (DB-004)
+    fn save_task_blocker(&self, task_id: Id, blocker: &TaskBlocker) -> Result<()>;
+    fn task_blocker(&self, task_id: Id) -> Result<Option<TaskBlocker>>;
+    fn delete_task_blocker(&self, task_id: Id) -> Result<()>;
 }
 
 pub type AssistantEvent = RunEventEnvelope;

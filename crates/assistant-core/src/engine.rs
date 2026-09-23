@@ -11,11 +11,13 @@ use tokio::sync::Mutex;
 pub struct Assistant {
     pub store: Arc<dyn Store>,
     fast: Arc<dyn ModelProvider>,
-    cloud: Arc<dyn ModelProvider>,
+    pub(crate) cloud: Arc<dyn ModelProvider>,
     executor: Arc<dyn ToolExecutor>,
-    config: EngineConfig,
+    pub(crate) config: EngineConfig,
     // ponytail: one active task runner; use per-task leases for concurrent execution.
     runner: Mutex<()>,
+    pub(crate) personal_guard: super::personalization::PersonalDataGuard,
+    pub(crate) learning: Mutex<()>,
 }
 
 impl Assistant {
@@ -33,6 +35,8 @@ impl Assistant {
             executor,
             config,
             runner: Mutex::new(()),
+            personal_guard: Arc::new(|_| Ok(())),
+            learning: Mutex::new(()),
         }
     }
     pub fn submit(&self, input: UserInput) -> Result<Task> {
@@ -43,9 +47,16 @@ impl Assistant {
         self.store.save_task(&task)?;
         Ok(task)
     }
+    pub fn with_personal_guard(mut self, guard: super::personalization::PersonalDataGuard) -> Self {
+        self.personal_guard = guard;
+        self
+    }
     pub fn cancel(&self, id: Id) -> Result<Task> {
         let mut task = self.store.task(id)?;
         if !task.status.terminal() {
+            if let Some(graph) = task.work_graph.as_mut() {
+                graph.cancel_remaining();
+            }
             task.status = TaskStatus::Cancelled;
             task.message = if task.pending.as_ref().is_some_and(|p| p.started) {
                 "Cancelled. An action already in flight may still finish."
@@ -105,7 +116,52 @@ impl Assistant {
         }
         task.status = TaskStatus::Created;
         self.store.save_task(&task)?;
+        self.store.delete_task_blocker(id)?;
         Ok(task)
+    }
+
+    /// The typed blocker for a paused task, if one was recorded.
+    /// Legacy rows without a record behave exactly as before.
+    pub fn current_blocker(&self, id: Id) -> Result<Option<TaskBlocker>> {
+        let task = self.store.task(id)?;
+        if task.status != TaskStatus::WaitingForAuth {
+            return Ok(None);
+        }
+        self.store.task_blocker(id)
+    }
+    /// Requeues safe graph work left by a previous process and returns tasks ready to run.
+    pub fn recover_unfinished_graphs(&self) -> Result<Vec<Id>> {
+        let mut ready = Vec::new();
+        for mut task in self.store.unfinished_tasks()? {
+            if !matches!(task.status, TaskStatus::Created | TaskStatus::Running)
+                || task.work_graph.is_none()
+            {
+                continue;
+            }
+            if task.pending.is_some() {
+                if task.pending.as_ref().is_some_and(|pending| pending.started) {
+                    task.status = TaskStatus::WaitingForResolution;
+                    task.message =
+                        "An interrupted action needs its outcome checked before continuing.".into();
+                    self.store.save_task(&task)?;
+                }
+                continue;
+            }
+            match super::graph::recover(&mut task, self.store.as_ref()) {
+                Ok(should_run) => {
+                    self.store.save_task(&task)?;
+                    if should_run {
+                        ready.push(task.id);
+                    }
+                }
+                Err(_) => {
+                    task.status = TaskStatus::WaitingForResolution;
+                    task.message = "Saved parallel work could not be safely validated.".into();
+                    self.store.save_task(&task)?;
+                }
+            }
+        }
+        Ok(ready)
     }
     pub async fn run(&self, id: Id) -> Result<Task> {
         let _guard = self.runner.lock().await;
@@ -132,6 +188,21 @@ impl Assistant {
             }
             if task.status != TaskStatus::Running {
                 return Ok(task);
+            }
+            if task
+                .work_graph
+                .as_ref()
+                .is_some_and(|graph| graph.nodes.iter().any(|node| !node.state.terminal()))
+            {
+                super::graph::run(
+                    &mut task,
+                    self.store.clone(),
+                    self.cloud.clone(),
+                    self.executor.clone(),
+                    &self.config,
+                )
+                .await?;
+                continue;
             }
             if task.step >= self.config.max_steps || task.failures >= self.config.max_failures {
                 task.status = TaskStatus::Failed;
@@ -164,6 +235,25 @@ impl Assistant {
                 continue;
             }
             task.step += 1;
+            self.store.record_personal_usage(
+                task.id,
+                task.input.conversation_id,
+                &context.adaptive_rules,
+            )?;
+            for skill in &context.skills {
+                if let Some(id) = skill
+                    .id
+                    .strip_prefix("personal:")
+                    .and_then(|id| Id::parse_str(id).ok())
+                {
+                    let rule = self.store.adaptive_rule(id)?;
+                    self.store.record_personal_usage(
+                        task.id,
+                        task.input.conversation_id,
+                        &[rule],
+                    )?;
+                }
+            }
             let exposed = context.tools.clone();
             let provider = if task.role == Role::Fast {
                 &self.fast
@@ -257,6 +347,12 @@ impl Assistant {
                     task.status = TaskStatus::WaitingForAuth;
                     task.message = "Cloud authentication is required. Update the API key in Settings, then resume.".into();
                     self.store.save_task(&task)?;
+                    self.store.save_task_blocker(
+                        task.id,
+                        &TaskBlocker::ProviderCredentialRequired {
+                            provider_id: self.cloud.id().to_owned(),
+                        },
+                    )?;
                 }
                 Err(Error::RateLimited) if task.role != Role::Fast => {
                     task.failures += 1;
@@ -335,6 +431,23 @@ impl Assistant {
                 task.search_query = query;
             }
             AgentAction::ActivateSkill { skill_id } => {
+                if let Some(id) = skill_id
+                    .strip_prefix("personal:")
+                    .and_then(|id| Id::parse_str(id).ok())
+                {
+                    if !self
+                        .store
+                        .personal_rules(
+                            task.input.conversation_id,
+                            None,
+                            super::personalization::now(),
+                        )?
+                        .iter()
+                        .any(|rule| rule.id == id)
+                    {
+                        return Err(Error::Denied);
+                    }
+                }
                 let skill = super::registry::activate(self.store.as_ref(), &skill_id)?;
                 task.active_skills.clear();
                 task.active_skills.push(skill);
@@ -349,6 +462,65 @@ impl Assistant {
                 task.plan = steps;
                 task.plan_revision += 1;
                 task.role = Role::Fast;
+            }
+            AgentAction::PlanGraph { proposal } => {
+                if task
+                    .work_graph
+                    .as_ref()
+                    .is_some_and(|graph| graph.nodes.iter().any(|node| !node.state.terminal()))
+                {
+                    return Err(Error::Conflict);
+                }
+                let context = super::context::build(self.store.as_ref(), task, &self.config)?;
+                task.plan = proposal
+                    .nodes
+                    .iter()
+                    .map(|node| node.objective.clone())
+                    .collect();
+                task.plan_revision += 1;
+                task.work_graph = Some(super::graph::expand(
+                    task,
+                    proposal,
+                    context,
+                    exposed,
+                    self.store.as_ref(),
+                    &self.config,
+                )?);
+            }
+            AgentAction::ProposeRule { proposal } => {
+                let evidence = proposal
+                    .rule
+                    .evidence_ids
+                    .first()
+                    .copied()
+                    .ok_or(Error::Denied)?;
+                if self.store.observation(evidence)?.conversation_id != task.input.conversation_id {
+                    return Err(Error::Denied);
+                }
+                let saved =
+                    super::personalization::PersonalizationService::new(self.store.as_ref())
+                        .propose_model(proposal, Some(evidence), &self.personal_guard)?;
+                let receipt = Id::new_v4();
+                self.store.save_result(receipt, &serde_json::json!({"proposal_id":saved.id,"status":"proposed","instruction":"Continue the original task; this preference awaits review."}))?;
+                task.result_refs.push(receipt);
+                task.message =
+                    "Preference suggestion saved for review; continuing your request.".into();
+            }
+            AgentAction::ProposeSkill {
+                skill,
+                rationale,
+                evidence_id,
+            } => {
+                let evidence = self.store.observation(evidence_id)?;
+                if evidence.conversation_id != task.input.conversation_id {
+                    return Err(Error::Denied);
+                }
+                let saved =
+                    super::personalization::PersonalizationService::new(self.store.as_ref())
+                        .propose_skill(skill, rationale, evidence_id, &self.personal_guard)?;
+                let receipt = Id::new_v4();
+                self.store.save_result(receipt,&serde_json::json!({"proposal_id":saved.id,"status":"evaluation_required","instruction":"Continue the original task."}))?;
+                task.result_refs.push(receipt);
             }
             AgentAction::Handoff {
                 role,
@@ -441,11 +613,17 @@ impl Assistant {
                 task.pending = None;
                 task.message.clear();
             }
-            Err(Error::AuthRequired) => {
+            Err(Error::AuthRequired) if current.risk.retry_safe() => {
                 pending.started = false;
                 task.pending = Some(pending);
                 task.status = TaskStatus::WaitingForAuth;
                 task.message = "Connect the required service to resume this task.".into();
+            }
+            Err(Error::AuthRequired) => {
+                task.status = TaskStatus::WaitingForResolution;
+                task.message =
+                    "The action may have completed before authentication failed. Check its outcome before retrying."
+                        .into();
             }
             Err(error)
                 if current.risk.retry_safe()

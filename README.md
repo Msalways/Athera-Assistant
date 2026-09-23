@@ -1,12 +1,16 @@
 # AETHRA
+
 ## Adaptive Edge Task & Hybrid Reasoning Assistant
 
-AETHRA is an Android-first, local-first personal assistant architecture.
+AETHRA is an Android-first, Needle-local-first and provider-neutral personal
+assistant. It turns a user's request into a safe, durable and verifiable job without
+exposing model or tool selection as product modes.
 
 Core idea:
 
-- **Needle** = fast local reflex / tool router.
-- **Cloud LLMs** = planning, reasoning, summarization, composition.
+- **Needle** = the local-first reflex for intent, supported routing and extraction.
+- **Cloud LLMs** = replaceable providers for work beyond Needle's declared ability.
+- **Offline chat model** = optional user-installed pack, never an onboarding requirement.
 - **Rust orchestrator** = owns tasks, context, routing, policy, retries and execution.
 - **MCP** = capability bus.
 - **Composio initially** = OAuth-backed Gmail / Calendar and other SaaS integrations.
@@ -19,32 +23,31 @@ The architecture must remain replaceable at every vendor boundary.
 
 ## Start here
 
-1. Read `AGENTS.md`.
-2. Read `docs/MASTER_BUILD_PLAN.md`.
-3. Read `docs/CAPABILITY_ROUTING.md`.
-4. Read `docs/AUTONOMOUS_AGENT_ARCHITECTURE.md`.
-5. Read `docs/VERTICAL_SLICE_PLAN.md` for implementation order and worker handoffs.
-6. Read `docs/ON_DEVICE_REASONING_RND.md` for the local-model research program.
-7. Read `docs/WEB_RESEARCH_CAPABILITY.md` for the web research worker and source-provenance contract.
-8. Read `docs/MCP_OAUTH_SECURITY.md` for MCP transports, authentication and secret handling.
-9. Read `docs/MOBILE_UI_AND_CONFIGURATION.md`.
-10. Read `docs/EVAL_STRATEGY.md` and `docs/AUTOMATED_EVAL_WORKFLOW.md`.
-11. Use `codex-prompts/vertical-slice-worker.md` and `vertical-slice-reviewer.md` for bounded implementation.
+1. Read `AGENTS.md` for engineering rules.
+2. Read `docs/ATHERA_JARVIS_BUILD_PLAN.md` — authoritative product and build plan.
+3. Read `docs/ATHERA_DEVELOPMENT_TASK_GRAPH.md` — dependency-aware task graph.
+4. Read `docs/CAPABILITY_ROUTING.md`.
+5. Read `docs/AUTONOMOUS_AGENT_ARCHITECTURE.md`.
+6. Treat `docs/MASTER_BUILD_PLAN.md` as historical input; it is superseded by the
+   authoritative plan above.
+7. Read `docs/ON_DEVICE_REASONING_RND.md` for optional large-local-model research.
+8. Read `docs/WEB_RESEARCH_CAPABILITY.md` for the web research worker.
+9. Read `docs/MCP_OAUTH_SECURITY.md` for MCP transports and auth.
+10. Read `docs/MOBILE_UI_AND_CONFIGURATION.md`.
+11. Read `docs/EVAL_STRATEGY.md` and `docs/AUTOMATED_EVAL_WORKFLOW.md`.
 
-## Tomorrow V0
+## First product gate
 
-The minimum convincing Android V0 should prove:
+Before adding more capabilities, the installed Android APK must prove:
 
-1. Tauri Android app launches on a physical ARM64 phone.
-2. Rust AssistantCore receives a chat request.
-3. Needle runs locally and can return a structured tool call.
-4. OpenAI and one OpenAI-compatible provider adapter work behind the same interface.
-5. MCP manager can connect to Composio.
-6. Gmail + Calendar OAuth can pause and resume a task.
-7. Context manager persists task/tool state in SQLite.
-8. External writes require confirmation.
-9. UI exposes Assistant, Activity, Connections, Models, Tools and Skills.
-10. Eval harness compares Needle-only, Cloud-only and Hybrid behavior.
+1. The displayed build fingerprint matches the source being tested.
+2. A user can configure and test an OpenAI-compatible cloud provider.
+3. The API key is kept through Android Keystore until expiry, revocation or deletion.
+4. `hi` receives a real cloud-model response through the Rust runtime.
+5. Provider credential failure is distinct from connector OAuth failure.
+6. The assistant uses one composer with no Conversation/Action mode selection.
+7. No offline model is required or promoted during this flow.
+8. Restart, cancellation and normalized provider errors are exercised on the device.
 
 ## Primary V0 demo
 
@@ -60,3 +63,66 @@ Second demo:
 > "Reply saying I'll review it tonight."
 
 Must resolve previous context, prepare the reply, require approval, then send only after approval.
+
+## Building
+
+### Prerequisites
+
+- Rust stable toolchain with `aarch64-linux-android` target
+- Node.js 24+
+- Android SDK 36 + NDK r27c
+- Tauri CLI 2
+
+### Quick start
+
+```powershell
+# Bootstrap development environment
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap.ps1
+
+# Full check (format, lint, tests, eval)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
+
+# Development server
+npm run dev
+```
+
+### Android build
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-sms-apk.ps1
+```
+
+## Repository structure
+
+```text
+crates/
+  contracts/           Vendor-neutral type boundaries (no provider/vendor leakage)
+  assistant-core/      Orchestration, routing, policy, context, verification
+  app-runtime/         Composition root; constructs adapters, exposes use cases
+  storage-sqlite/      SQLite persistence, migrations, FTS5
+  provider-cloud/      OpenAI cloud adapter (to be replaced by provider-rig)
+  provider-needle/     Needle on-device provider
+  provider-local-chat/ llama.cpp offline provider (experimental only)
+  adapter-mcp/         MCP client, OAuth discovery, capability bus
+  assistant-cli/       CLI evaluation runner
+
+apps/mobile/
+  src/                 React/TypeScript mobile UI
+  src-tauri/           Tauri shell + Android native bridge
+
+evals/                 Python evaluation tooling, fixtures, datasets
+docs/                  Authoritative architecture and plan documents
+scripts/               Build, dev, and CI scripts
+```
+
+## Coding conventions
+
+- **Rust**: `unsafe_code = "forbid"`, `thiserror` for errors, `serde` with `rename_all`,
+  `async_trait` for async traits, `uuid` for identifiers. No vendor-specific types in
+  contracts. Format with `cargo fmt`, lint with `cargo clippy`.
+- **TypeScript**: React 19, Vite 7, Vitest, strict TypeScript. Component files are
+  PascalCase, utility files are camelCase. Use `lucide-react` for icons.
+- **CSS**: Mobile-first, CSS custom properties, `prefers-color-scheme` dark mode,
+  `env(safe-area-inset-*)` for notched phones, 44px minimum touch targets.
+- **Docs**: Authoritative plans live in `docs/`. `AGENTS.md` is the engineering rule
+  set. Historical plans are marked superseded.

@@ -1,4 +1,4 @@
-export type Status =
+﻿export type Status =
   | "created"
   | "running"
   | "waiting_for_auth"
@@ -148,24 +148,109 @@ export interface Settings {
     preset?: "parallel_search" | null;
   }[];
 }
+export interface BuildInfo {
+  git_hash: string;
+  git_dirty: boolean;
+  build_timestamp: number;
+  version: string;
+}
 export interface Snapshot {
   cloud_session_key: boolean;
   cloud_credential: "not_configured" | "missing" | "configured";
   tasks: Task[];
   capabilities: Capability[];
   settings: Settings;
+  connections: ConnectionState[];
   needle: string;
   voice: string;
   local_chat?: ProviderAvailability;
+  adaptive_rules?: AdaptiveRule[];
+  rule_proposals?: RuleProposal[];
+  suggestions?: NextStepSuggestion[];
+}
+
+export interface CloudConnectionTest {
+  state:
+    | "connected"
+    | "authentication_required"
+    | "invalid_configuration"
+    | "rate_limited"
+    | "timed_out"
+    | "unavailable";
+  message: string;
+}
+
+export interface NextStepSuggestion {
+  id: string;
+  task_id: string;
+  kind: "approval" | "question" | "authorization" | "progress";
+  title: string;
+  reason: string;
+}
+
+export type AdaptiveRuleStatus =
+  "proposed" | "enabled" | "disabled" | "rejected";
+export interface AdaptiveRule {
+  schema: "aethra.adaptive-rule.v1";
+  id: string;
+  version: number;
+  scope: "global" | { conversation: string } | { workflow: string };
+  status: AdaptiveRuleStatus;
+  source: "user" | "model" | "imported" | "system";
+  priority: number;
+  instruction: string;
+  preference_key?: string | null;
+  evidence_ids: string[];
+  created_at: number;
+  updated_at: number;
+  expires_at: number | null;
+  supersedes: string | null;
+}
+export interface RuleProposal {
+  schema: "aethra.rule-proposal.v1";
+  id: string;
+  rule: AdaptiveRule;
+  rationale: string;
+  proposed_at: number;
+}
+export interface RuleRevision {
+  rule: AdaptiveRule;
+  decision: string;
+  historical_baseline: boolean;
 }
 
 export interface OAuthAuthorizationStart {
   transaction_id: string;
   connection_id: string;
-  authorization_url: string;
+  authorization_url?: string;
   expires_at: number;
   requested_scopes: string[];
   resume_task_id: string | null;
+}
+
+export interface ConnectionState {
+  schema: "aethra.connection-state.v1";
+  connection_id: string;
+  service_name: string;
+  state:
+    | "connected"
+    | "required"
+    | "connecting"
+    | "refreshing"
+    | "expired"
+    | "step_up_required"
+    | "denied"
+    | "revoked"
+    | "unavailable";
+  requested_scopes: string[];
+  granted_scopes: string[];
+  expires_at: number | null;
+  resume_task_id: string | null;
+  message: string;
+}
+
+export interface OAuthAuthorizationPoll {
+  state: "waiting_for_user_authorization" | "connected";
 }
 
 export interface OAuthConnectionStatus {
@@ -246,4 +331,91 @@ export interface ResearchSession {
   decisions: string[];
   experiments: string[];
   notes: NoteRevision[];
+}
+export type TransportFamily =
+  | "open_ai_compatible"
+  | "anthropic_compatible"
+  | "aws_bedrock"
+  | "google_vertex_ai"
+  | "google_gemini"
+  | "custom";
+export type CatalogProviderAvailability =
+  | "available"
+  | "requires_configuration"
+  | "unsupported"
+  | "disabled_by_feature";
+export type ModelSource = "catalog" | "user_specified" | "fixed";
+export type AuthKind =
+  | "none"
+  | "api_key"
+  | "bearer_token"
+  | "composite_static_secret"
+  | "oauth2_pkce"
+  | "workload_identity"
+  | "cloud_identity"
+  | "custom_compatible";
+export type ConfigFieldKind =
+  | "text"
+  | "secret"
+  | "select"
+  | "boolean"
+  | "url"
+  | "integer";
+export interface VisibilityRule {
+  field_id: string;
+  equals: string;
+}
+export interface ConfigFieldSpec {
+  id: string;
+  label: string;
+  kind: ConfigFieldKind;
+  required: boolean;
+  secret: boolean;
+  validation: {
+    min_length?: number | null;
+    max_length?: number | null;
+    pattern?: string | null;
+    min_value?: number | null;
+    max_value?: number | null;
+  } | null;
+  options: string[];
+  visible_when: VisibilityRule[];
+  help_text?: string | null;
+}
+export interface HeaderPair {
+  name: string;
+  value: string;
+}
+export interface AuthOptionSpec {
+  id: string;
+  label: string;
+  auth_kind: AuthKind;
+  fields: ConfigFieldSpec[];
+  expiry_behavior: string;
+  refresh_behavior: string;
+  android_support: string;
+  wire_header: string | null;
+  wire_prefix: string | null;
+  extra_headers: HeaderPair[];
+}
+export interface ProviderDefinition {
+  schema: "aethra.provider-catalog.v1";
+  id: string;
+  display_name: string;
+  transport_family: TransportFamily;
+  capabilities: {
+    streaming: boolean;
+    tool_calls: boolean;
+    vision: boolean;
+    max_context_tokens: number | null;
+  };
+  endpoint_fields: ConfigFieldSpec[];
+  model_source: ModelSource;
+  auth_options: AuthOptionSpec[];
+  availability: CatalogProviderAvailability;
+  documentation_url: string | null;
+}
+export interface ProviderCatalogPayload {
+  schema: "aethra.provider-catalog-registry.v1";
+  providers: ProviderDefinition[];
 }

@@ -13,11 +13,15 @@ mod conversations;
 mod credentials;
 mod local_models;
 mod oauth_runtime;
+mod personalization;
 use credentials::SessionSecrets;
-use oauth_runtime::OAuthRuntime;
+pub use oauth_runtime::OAuthTokenVault;
+use oauth_runtime::{OAuthRuntime, OAuthState};
 
 #[cfg(test)]
 mod conversation_tests;
+#[cfg(test)]
+mod personalization_tests;
 #[cfg(test)]
 mod tests;
 
@@ -70,7 +74,8 @@ pub struct Runtime {
     pub store: Arc<SqliteStore>,
     pub assistant: RwLock<Arc<Assistant>>,
     pub mcp: Arc<McpManager>,
-    needle: Arc<NeedleProvider>,
+    fast: Arc<dyn ModelProvider>,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
     settings: RwLock<Settings>,
     secrets: Arc<SessionSecrets>,
     oauth: Arc<OAuthRuntime>,
@@ -80,8 +85,60 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path.as_ref(), None, None)
+    }
+
+    /// Opens the runtime with the device's fast local model.
+    pub fn open_with_fast_provider(
+        path: impl AsRef<Path>,
+        fast: Arc<dyn ModelProvider>,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), None, Some(fast))
+    }
+
+    pub fn open_with_oauth_vault(
+        path: impl AsRef<Path>,
+        vault: Arc<dyn OAuthTokenVault>,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), Some(vault), None)
+    }
+
+    /// Opens the runtime with durable OAuth storage and the device's fast local model.
+    /// The vendor-neutral contract lets platform shells link native models without
+    /// making orchestration depend on their vendor.
+    pub fn open_with_oauth_vault_and_fast_provider(
+        path: impl AsRef<Path>,
+        vault: Arc<dyn OAuthTokenVault>,
+        fast: Arc<dyn ModelProvider>,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), Some(vault), Some(fast))
+    }
+
+    /// Opens the runtime with a platform executor for device-native actions.
+    pub fn open_with_oauth_vault_fast_provider_and_executor(
+        path: impl AsRef<Path>,
+        vault: Arc<dyn OAuthTokenVault>,
+        fast: Arc<dyn ModelProvider>,
+        executor: Arc<dyn ToolExecutor>,
+    ) -> Result<Self> {
+        Self::open_inner_with_executor(path.as_ref(), Some(vault), Some(fast), Some(executor))
+    }
+
+    fn open_inner(
+        path: &Path,
+        vault: Option<Arc<dyn OAuthTokenVault>>,
+        injected_fast: Option<Arc<dyn ModelProvider>>,
+    ) -> Result<Self> {
+        Self::open_inner_with_executor(path, vault, injected_fast, None)
+    }
+
+    fn open_inner_with_executor(
+        path: &Path,
+        vault: Option<Arc<dyn OAuthTokenVault>>,
+        injected_fast: Option<Arc<dyn ModelProvider>>,
+        injected_executor: Option<Arc<dyn ToolExecutor>>,
+    ) -> Result<Self> {
         let model_root = path
-            .as_ref()
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("models");
@@ -100,27 +157,39 @@ impl Runtime {
             )?;
         }
         let secrets = Arc::new(SessionSecrets::default());
-        let oauth = Arc::new(OAuthRuntime::new(secrets.clone())?);
+        let oauth = Arc::new(OAuthRuntime::with_vault(
+            secrets.clone(),
+            vault,
+            &settings.connections,
+        )?);
         let mcp = Arc::new(McpManager::new(oauth.clone()));
-        let needle = Arc::new(
-            std::env::var_os("ASSISTANT_NEEDLE_LIBRARY")
-                .and_then(|path| NeedleProvider::verified_windows(Path::new(&path)).ok())
-                .unwrap_or_else(NeedleProvider::unavailable),
-        );
+        let fast = injected_fast.unwrap_or_else(|| {
+            Arc::new(
+                std::env::var_os("ASSISTANT_NEEDLE_LIBRARY")
+                    .and_then(|path| NeedleProvider::verified_windows(Path::new(&path)).ok())
+                    .unwrap_or_else(NeedleProvider::unavailable),
+            )
+        });
         let assistant = assemble(
             store.clone(),
             mcp.clone(),
-            needle.clone(),
+            fast.clone(),
+            injected_executor.clone(),
             &settings,
             &secrets,
+            &oauth,
         )?;
+        let recovery = assistant.recover_unfinished_graphs()?;
+        launch_recovery(assistant.clone(), recovery)?;
+        personalization::kick_learning(assistant.clone());
         let conversations =
             conversations::Conversations::new(store.clone(), local_models.provider.clone());
         Ok(Self {
             store,
             assistant: RwLock::new(assistant),
             mcp,
-            needle,
+            fast,
+            tool_executor: injected_executor,
             settings: RwLock::new(settings),
             secrets,
             oauth,
@@ -131,6 +200,10 @@ impl Runtime {
     }
     pub async fn snapshot(&self) -> Result<serde_json::Value> {
         let settings = self.settings.read().await.clone();
+        let mut connections = Vec::with_capacity(settings.connections.len());
+        for config in &settings.connections {
+            connections.push(self.connection_state(config).await?);
+        }
         let cloud_credential = match &settings.cloud {
             None => "not_configured",
             Some(config) => {
@@ -150,9 +223,182 @@ impl Runtime {
             .cloud
             .as_ref()
             .is_some_and(|cloud| self.secrets.contains(cloud));
+        let adaptive_rules = self.store.adaptive_rules(None, 100)?;
+        let rule_proposals = self.store.rule_proposals(None, 100)?;
+        let tasks = self.store.tasks()?;
+        let suggestions = self.next_step_suggestions(&tasks);
         Ok(
-            serde_json::json!({"tasks":self.store.tasks()?,"capabilities":self.store.capabilities()?,"settings":settings,"cloud_credential":cloud_credential,"cloud_session_key":cloud_session_key,"needle":if self.needle.is_available(){"ready"}else{"not_linked"},"voice":"deferred"}),
+            serde_json::json!({"tasks":tasks,"capabilities":self.store.capabilities()?,"settings":settings,"connections":connections,"adaptive_rules":adaptive_rules,"rule_proposals":rule_proposals,"cloud_credential":cloud_credential,"cloud_session_key":cloud_session_key,"needle":if self.fast.is_available(){"ready"}else{"not_linked"},"voice":"deferred","suggestions":suggestions}),
         )
+    }
+
+    /// Restores a platform-keystore credential into the in-memory provider scope.
+    /// The value remains outside SQLite and model context.
+    pub fn restore_cloud_key(&self, config: &CloudConfig, key: String) -> Result<()> {
+        self.secrets.set(config, key)
+    }
+
+    fn next_step_suggestions(&self, tasks: &[Task]) -> Vec<serde_json::Value> {
+        let mut suggestions = Vec::new();
+        for task in tasks.iter().filter(|task| !task.status.terminal()).take(3) {
+            let suggestion = match task.status {
+                TaskStatus::WaitingForApproval => Some((
+                    "review_approval",
+                    "approval",
+                    "Review the pending action",
+                    "This task is ready for your approval.",
+                )),
+                TaskStatus::WaitingForUser | TaskStatus::WaitingForResolution => Some((
+                    "answer_task",
+                    "question",
+                    "Answer the assistant’s question",
+                    "The workflow needs one detail to continue.",
+                )),
+                TaskStatus::WaitingForAuth => Some(self.auth_suggestion(task)),
+                TaskStatus::Created | TaskStatus::Running => Some((
+                    "view_progress",
+                    "progress",
+                    "View workflow progress",
+                    "Aethra is continuing this task.",
+                )),
+                _ => None,
+            };
+            if let Some((id, kind, title, reason)) = suggestion {
+                suggestions.push(serde_json::json!({"id":id,"task_id":task.id,"kind":kind,"title":title,"reason":reason}));
+            }
+        }
+        suggestions
+    }
+
+    fn auth_suggestion(
+        &self,
+        task: &Task,
+    ) -> (&'static str, &'static str, &'static str, &'static str) {
+        let fallback = (
+            "connect_service",
+            "authorization",
+            "Connect the requested service",
+            "The workflow is waiting for authorization.",
+        );
+        let blocker = match self.store.task_blocker(task.id) {
+            Ok(Some(blocker)) => blocker,
+            _ => return fallback,
+        };
+        let title = match blocker {
+            TaskBlocker::ProviderCredentialRequired { .. } => "Update the provider API key",
+            TaskBlocker::ConnectorAuthorizationRequired { .. } => "Connect the requested service",
+            TaskBlocker::AndroidPermissionRequired { .. } => "Grant the Android permission",
+            TaskBlocker::ApprovalRequired { .. } => "Review the pending action",
+            TaskBlocker::ClarificationRequired { .. } => "Answer the assistant's question",
+            TaskBlocker::DeviceConstraint { .. } => "Resolve the device constraint",
+            TaskBlocker::CapabilityUnavailable { .. } => "Connect a supporting service",
+        };
+        (
+            "connect_service",
+            "authorization",
+            title,
+            blocker.recovery_action(),
+        )
+    }
+
+    async fn connection_state(&self, config: &ConnectionConfig) -> Result<ConnectionState> {
+        let (state, granted_scopes, expires_at, message) = match &config.authentication {
+            McpAuthentication::None => (
+                ConnectionStatus::Connected,
+                vec![],
+                None,
+                "No credential required.".into(),
+            ),
+            McpAuthentication::OauthAuthorizationCode {
+                requested_scopes, ..
+            } => {
+                let status = self.oauth.status(config)?;
+                let challenge = self.mcp.oauth_challenge(&config.id).await;
+                let (state, message) = if challenge
+                    .as_ref()
+                    .is_some_and(|challenge| challenge.insufficient_scope)
+                {
+                    (
+                        ConnectionStatus::StepUpRequired,
+                        format!("{} needs additional access to continue.", config.name),
+                    )
+                } else {
+                    match status.state {
+                        OAuthState::Missing => (
+                            ConnectionStatus::Required,
+                            format!("Connect {} to continue.", config.name),
+                        ),
+                        OAuthState::WaitingForUserAuthorization => (
+                            ConnectionStatus::Connecting,
+                            format!("Finish connecting {} in your browser.", config.name),
+                        ),
+                        OAuthState::Connected => (
+                            ConnectionStatus::Connected,
+                            format!("{} is connected.", config.name),
+                        ),
+                        OAuthState::Expired => (
+                            ConnectionStatus::Expired,
+                            format!("Reconnect {} to continue.", config.name),
+                        ),
+                    }
+                };
+                let requested_scopes = challenge
+                    .filter(|challenge| challenge.insufficient_scope)
+                    .map(|challenge| {
+                        let mut scopes = requested_scopes.clone();
+                        for scope in challenge.scopes {
+                            if !scopes.contains(&scope) {
+                                scopes.push(scope);
+                            }
+                        }
+                        scopes
+                    })
+                    .unwrap_or_else(|| requested_scopes.clone());
+                let public = ConnectionState {
+                    schema: CONNECTION_STATE_SCHEMA_V1.into(),
+                    connection_id: config.id.clone(),
+                    service_name: config.name.clone(),
+                    state,
+                    requested_scopes,
+                    granted_scopes: status.granted_scopes,
+                    expires_at: status.expires_at,
+                    resume_task_id: None,
+                    message,
+                };
+                public.validate()?;
+                return Ok(public);
+            }
+            McpAuthentication::BearerToken { .. } | McpAuthentication::ApiKeyHeader { .. } => {
+                if self.secrets.contains_mcp(config) {
+                    (
+                        ConnectionStatus::Connected,
+                        vec![],
+                        None,
+                        format!("{} credential is configured.", config.name),
+                    )
+                } else {
+                    (
+                        ConnectionStatus::Required,
+                        vec![],
+                        None,
+                        format!("Add a credential for {} to continue.", config.name),
+                    )
+                }
+            }
+        };
+        let public = ConnectionState {
+            schema: CONNECTION_STATE_SCHEMA_V1.into(),
+            connection_id: config.id.clone(),
+            service_name: config.name.clone(),
+            state,
+            requested_scopes: vec![],
+            granted_scopes,
+            expires_at,
+            resume_task_id: None,
+            message,
+        };
+        public.validate()?;
+        Ok(public)
     }
     pub async fn configure(&self, settings: Settings) -> Result<()> {
         if settings
@@ -173,14 +419,17 @@ impl Runtime {
         let next = assemble(
             self.store.clone(),
             self.mcp.clone(),
-            self.needle.clone(),
+            self.fast.clone(),
+            self.tool_executor.clone(),
             &settings,
             &self.secrets,
+            &self.oauth,
         )?;
         self.store.set_setting(
             "settings",
             &serde_json::to_value(&settings).map_err(|_| Error::InvalidInput)?,
         )?;
+        personalization::kick_learning(next.clone());
         *self.assistant.write().await = next;
         *self.settings.write().await = settings;
         Ok(())
@@ -256,6 +505,10 @@ impl Runtime {
         };
         match name {
             "snapshot" => self.snapshot().await,
+            "next_step_suggestions" => {
+                let tasks = self.store.tasks()?;
+                Ok(serde_json::json!(self.next_step_suggestions(&tasks)))
+            }
             "submit_input" => {
                 self.reject_known_secrets(&payload).await?;
                 let input: UserInput =
@@ -269,6 +522,24 @@ impl Runtime {
                 Ok(serde_json::json!(null))
             }
             "cancel_task" => Ok(serde_json::json!(assistant.cancel(task_id()?)?)),
+            "list_adaptive_rules"
+            | "list_rule_proposals"
+            | "propose_rule"
+            | "remember_preference"
+            | "review_rule_proposal"
+            | "disable_adaptive_rule"
+            | "rollback_rule"
+            | "rule_history"
+            | "record_observation"
+            | "process_learning"
+            | "personal_usage"
+            | "propose_skill"
+            | "evaluate_skill"
+            | "learning_settings"
+            | "personal_rule_details" => {
+                self.reject_known_secrets(&payload).await?;
+                self.personal_command(name, payload).await
+            }
             "resume_auth" => {
                 let task = assistant.resume_auth(task_id()?)?;
                 launch(assistant, task.id);
@@ -316,6 +587,21 @@ impl Runtime {
                     self.secrets.set(&request.cloud, key)?;
                 }
                 Ok(serde_json::json!(null))
+            }
+            "test_cloud_provider" => {
+                let request: SaveCloudProvider =
+                    serde_json::from_value(payload).map_err(|_| Error::InvalidInput)?;
+                let secrets = if let Some(key) = request.api_key {
+                    let secrets = Arc::new(SessionSecrets::default());
+                    secrets.set(&request.cloud, key)?;
+                    secrets
+                } else {
+                    self.secrets.clone()
+                };
+                let provider =
+                    CloudProvider::new(request.cloud.clone(), secrets.provider(&request.cloud))?;
+                serde_json::to_value(provider.test_connection().await)
+                    .map_err(|_| Error::InvalidResponse)
             }
             "clear_cloud_key" => {
                 self.secrets.clear()?;
@@ -367,25 +653,8 @@ impl Runtime {
                     .iter()
                     .find(|connection| connection.id == connection_id)
                     .ok_or(Error::InvalidInput)?;
-                if matches!(
-                    config.authentication,
-                    McpAuthentication::OauthAuthorizationCode { .. }
-                ) {
-                    return serde_json::to_value(self.oauth.status(config)?)
-                        .map_err(|_| Error::InvalidResponse);
-                }
-                let credential = if !config.authentication.requires_auth() {
-                    "not_required"
-                } else if self.secrets.contains_mcp(config) {
-                    "configured"
-                } else {
-                    "missing"
-                };
-                Ok(serde_json::json!({
-                    "connection_id": config.id,
-                    "authentication": config.authentication,
-                    "credential": credential
-                }))
+                serde_json::to_value(self.connection_state(config).await?)
+                    .map_err(|_| Error::InvalidResponse)
             }
             "start_mcp_oauth" => {
                 let request: StartMcpOAuth =
@@ -597,28 +866,88 @@ fn repair_credential_reference(settings: &mut Settings) -> bool {
     false
 }
 fn launch(assistant: Arc<Assistant>, id: Id) {
-    tokio::spawn(async move {
-        if let Err(error) = assistant.run(id).await {
-            if let Ok(mut task) = assistant.store.task(id) {
-                if !task.status.terminal() && task.status != TaskStatus::WaitingForResolution {
-                    task.status = if task.pending.as_ref().is_some_and(|p| p.started) {
-                        TaskStatus::WaitingForResolution
-                    } else {
-                        TaskStatus::Failed
-                    };
-                    task.message = error.to_string();
-                    let _ = assistant.store.save_task(&task);
+    tokio::spawn(run_task(assistant, id));
+}
+
+fn bounded_rule_text(payload: &serde_json::Value, key: &str, limit: usize) -> Result<String> {
+    let value = payload[key].as_str().ok_or(Error::InvalidInput)?.trim();
+    if value.is_empty() || value.chars().count() > limit {
+        return Err(Error::InvalidInput);
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_rule_scope(value: &str) -> Result<RuleScope> {
+    if value == "global" {
+        return Ok(RuleScope::Global);
+    }
+    if let Some(id) = value.strip_prefix("conversation:") {
+        return Id::parse_str(id)
+            .map(RuleScope::Conversation)
+            .map_err(|_| Error::InvalidInput);
+    }
+    if let Some(name) = value.strip_prefix("workflow:") {
+        if name.trim().is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        return Ok(RuleScope::Workflow(name.to_owned()));
+    }
+    Err(Error::InvalidInput)
+}
+
+fn launch_recovery(assistant: Arc<Assistant>, task_ids: Vec<Id>) -> Result<()> {
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        for task_id in task_ids {
+            handle.spawn(run_task(assistant.clone(), task_id));
+        }
+        return Ok(());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| Error::Unavailable)?;
+    std::thread::Builder::new()
+        .name("aethra-recovery".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                for task_id in task_ids {
+                    run_task(assistant.clone(), task_id).await;
                 }
+            });
+        })
+        .map_err(|_| Error::Unavailable)?;
+    Ok(())
+}
+
+async fn run_task(assistant: Arc<Assistant>, id: Id) {
+    if let Err(error) = assistant.run(id).await {
+        if let Ok(mut task) = assistant.store.task(id) {
+            if !task.status.terminal() && task.status != TaskStatus::WaitingForResolution {
+                task.status = if task.pending.as_ref().is_some_and(|p| p.started) {
+                    TaskStatus::WaitingForResolution
+                } else {
+                    TaskStatus::Failed
+                };
+                task.message = error.to_string();
+                let _ = assistant.store.save_task(&task);
             }
         }
-    });
+    }
+    if let Ok(task) = assistant.store.task(id) {
+        let _ = assistant.record_task_outcome(&task);
+    }
 }
 fn assemble(
     store: Arc<SqliteStore>,
     mcp: Arc<McpManager>,
-    needle: Arc<NeedleProvider>,
+    fast: Arc<dyn ModelProvider>,
+    injected_executor: Option<Arc<dyn ToolExecutor>>,
     settings: &Settings,
     secrets: &Arc<SessionSecrets>,
+    oauth: &Arc<OAuthRuntime>,
 ) -> Result<Arc<Assistant>> {
     let config = &settings.engine;
     if config.max_steps == 0
@@ -641,11 +970,49 @@ fn assemble(
         )?),
         None => Arc::new(NeedleProvider::unavailable()),
     };
-    Ok(Arc::new(Assistant::new(
-        store,
-        needle,
-        cloud,
-        mcp,
-        settings.engine.clone(),
-    )))
+    let secret_store = secrets.clone();
+    let oauth_store = oauth.clone();
+    let cloud_config = settings.cloud.clone();
+    let guard = Arc::new(move |payload: &serde_json::Value| {
+        if secret_store.payload_contains_secret(payload)
+            || oauth_store.payload_contains_secret(payload)
+        {
+            return Err(Error::Denied);
+        }
+        if let Some(config) = &cloud_config {
+            if let Ok(secret) = secret_store.provider(config).get(&config.secret_ref) {
+                if !secret.is_empty() && contains_secret(payload, &secret) {
+                    return Err(Error::Denied);
+                }
+            }
+        }
+        Ok(())
+    });
+    let executor: Arc<dyn ToolExecutor> = match injected_executor {
+        Some(native) => Arc::new(RoutingExecutor {
+            native,
+            mcp: mcp.clone(),
+        }),
+        None => mcp,
+    };
+    Ok(Arc::new(
+        Assistant::new(store, fast, cloud, executor, settings.engine.clone())
+            .with_personal_guard(guard),
+    ))
+}
+
+struct RoutingExecutor {
+    native: Arc<dyn ToolExecutor>,
+    mcp: Arc<McpManager>,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor for RoutingExecutor {
+    async fn execute(&self, spec: &ToolSpec, call: &ToolCall) -> Result<serde_json::Value> {
+        if spec.source_tool == "open_external" {
+            self.native.execute(spec, call).await
+        } else {
+            self.mcp.execute(spec, call).await
+        }
+    }
 }

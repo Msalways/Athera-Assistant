@@ -10,7 +10,6 @@ import {
 } from "lucide-react";
 import { command } from "./service";
 import type {
-  ModelStatus,
   RunEventEnvelope,
   RunEventPage,
   Snapshot,
@@ -18,18 +17,14 @@ import type {
 } from "./types";
 import { TaskView } from "./TaskView";
 import { Configuration } from "./Configuration";
-import { ConversationView } from "./ConversationView";
 
 type View = "assistant" | "activity" | "connections" | "settings";
 export default function App() {
   const [view, setView] = useState<View>("assistant");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [model, setModel] = useState<ModelStatus | null>(null);
-  const [modelOffline, setModelOffline] = useState(false);
   const [error, setError] = useState("");
   const [actionDraft, setActionDraft] = useState("");
   const [sendingAction, setSendingAction] = useState(false);
-  const [actionMode, setActionMode] = useState(false);
   const [conversation] = useState(() => crypto.randomUUID());
   const [selected, setSelected] = useState<string | null>(null);
   const [runEvents, setRunEvents] = useState<RunEventEnvelope[]>([]);
@@ -61,11 +56,13 @@ export default function App() {
         after = page.next_after;
         setRunEvents((current) => {
           const retained = page.reset_required ? [] : current;
-          const known = new Set(retained.map((event) => event.event_id));
-          return [
-            ...retained,
-            ...page.events.filter((event) => !known.has(event.event_id)),
-          ].slice(-500);
+          const unique = new Map(
+            retained.map((event) => [event.event_id, event]),
+          );
+          for (const event of page.events) unique.set(event.event_id, event);
+          return [...unique.values()]
+            .sort((left, right) => left.sequence - right.sequence)
+            .slice(-500);
         });
       } catch {
         // Snapshot polling above owns the user-visible bridge error.
@@ -73,20 +70,6 @@ export default function App() {
     };
     void poll();
     const timer = setInterval(() => void poll(), 750);
-    return () => clearInterval(timer);
-  }, []);
-  useEffect(() => {
-    const checkModel = async () => {
-      try {
-        setModel(await command<ModelStatus>("model_status"));
-        setModelOffline(false);
-      } catch {
-        setModel(null);
-        setModelOffline(true);
-      }
-    };
-    void checkModel();
-    const timer = setInterval(() => void checkModel(), 1500);
     return () => clearInterval(timer);
   }, []);
   async function act(name: string, payload: unknown) {
@@ -129,19 +112,19 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="app-mark">
-          <MessageSquare size={22} />
+          <img src="/athera-orbit.png" alt="" />
         </div>
         <div>
-          <h1>{actionMode ? "Actions" : "Assistant"}</h1>
+          <h1>Athera</h1>
           <span className="connection-state">
             <i className={snapshot ? "online" : ""} />
-            {actionMode
-              ? active
-                ? "Working"
-                : snapshot?.cloud_credential === "missing"
-                  ? "API key needed for actions"
-                  : "Action mode"
-              : modelStatusLabel(model, modelOffline)}
+            {active
+              ? "Working"
+              : snapshot?.cloud_credential === "missing"
+                ? "API key needed"
+                : snapshot?.cloud_credential === "configured"
+                  ? "Ready"
+                  : "Offline"}
           </span>
         </div>
         <div className="header-actions">
@@ -172,60 +155,48 @@ export default function App() {
       )}
       <main>
         {view === "assistant" && (
-          <>
-            <div
-              className="mode-switcher"
-              role="group"
-              aria-label="Assistant mode"
-            >
-              <button
-                aria-pressed={!actionMode}
-                onClick={() => setActionMode(false)}
-              >
-                Conversation
-              </button>
-              <button
-                aria-pressed={actionMode}
-                onClick={() => setActionMode(true)}
-              >
-                Action
-              </button>
-            </div>
-            {actionMode ? (
-              <section className="conversation">
-                {tasks.length === 0 ? (
-                  <div className="empty-conversation">
-                    <MessageSquare size={34} />
-                    <h2>What would you like me to do?</h2>
-                    <p>
-                      Actions can use connected tools and may ask for approval.
-                    </p>
-                  </div>
-                ) : (
-                  tasks.map((task) => (
-                    <TaskView
-                      key={task.id}
-                      task={task}
-                      events={runEvents.filter(
-                        (event) => event.run_id === task.id,
-                      )}
-                      act={act}
-                    />
-                  ))
-                )}
-              </section>
+          <section className="conversation">
+            {tasks.length === 0 ? (
+              <div className="empty-conversation">
+                <MessageSquare size={34} />
+                <h2>What would you like me to do?</h2>
+                <p>
+                  Athera interprets your request, uses relevant context, and
+                  acts within explicit authority.
+                </p>
+              </div>
             ) : (
-              <ConversationView
-                model={model}
-                modelOffline={modelOffline}
-                onOpenSettings={() => setView("settings")}
-              />
+              tasks.map((task) => (
+                <TaskView
+                  key={task.id}
+                  task={task}
+                  events={runEvents.filter(
+                    (event) => event.run_id === task.id,
+                  )}
+                  act={act}
+                />
+              ))
             )}
-          </>
+          </section>
         )}
         {view === "activity" && (
           <section className="page">
             <h2>Activity</h2>
+            {snapshot?.suggestions && snapshot.suggestions.length > 0 && (
+              <section aria-label="Suggested next steps" className="notice-card">
+                <h3>Suggested next steps</h3>
+                {snapshot.suggestions.map((suggestion) => (
+                  <button
+                    className="activity-row"
+                    key={`${suggestion.id}-${suggestion.task_id}`}
+                    onClick={() => setSelected(suggestion.task_id)}
+                  >
+                    <span>{suggestion.title}</span>
+                    <small>{suggestion.reason}</small>
+                  </button>
+                ))}
+              </section>
+            )}
             {selection ? (
               <>
                 <button
@@ -285,7 +256,7 @@ export default function App() {
           <p className="empty-state">Assistant unavailable</p>
         )}
       </main>
-      {view === "assistant" && actionMode && (
+      {view === "assistant" && (
         <form
           className="composer"
           onSubmit={(e) => {
@@ -295,20 +266,20 @@ export default function App() {
         >
           <div className="compose-row">
             <label className="sr-only" htmlFor="action-message">
-              Action request
+              Ask Athera
             </label>
             <textarea
               id="action-message"
               rows={2}
-              placeholder="Describe an action…"
+              placeholder="What would you like me to do?"
               value={actionDraft}
               maxLength={8000}
               onChange={(e) => setActionDraft(e.target.value)}
             />
             <button
               className="send-button"
-              aria-label="Send action"
-              title="Send action"
+              aria-label="Send"
+              title="Send"
               disabled={!actionDraft.trim() || sendingAction || !snapshot}
               type="submit"
             >
@@ -320,7 +291,7 @@ export default function App() {
       <nav className="bottom-nav" aria-label="Main navigation">
         {(
           [
-            { id: "assistant", label: "Assistant", Icon: MessageSquare },
+            { id: "assistant", label: "Athera", Icon: MessageSquare },
             { id: "activity", label: "Activity", Icon: Activity },
             { id: "connections", label: "Connections", Icon: Cable },
             { id: "settings", label: "Settings", Icon: SettingsIcon },
@@ -338,22 +309,6 @@ export default function App() {
       </nav>
     </div>
   );
-}
-function modelStatusLabel(model: ModelStatus | null, offline: boolean) {
-  if (!model)
-    return offline ? "Local model status unavailable" : "Checking local model";
-  if (model.installation?.status === "downloading")
-    return "Downloading local model";
-  if (model.installation?.status === "verifying")
-    return "Verifying local model";
-  if (model.installation?.status === "failed")
-    return "Local model download failed";
-  return {
-    missing_model: "Local model needed",
-    ready: "Local model ready",
-    busy: "Local model busy",
-    unavailable: "Local model unavailable",
-  }[model.availability];
 }
 export function label(status: Task["status"]) {
   return {

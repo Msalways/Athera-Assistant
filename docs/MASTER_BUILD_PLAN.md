@@ -1,6 +1,21 @@
-# Offline-Capable Phone Companion
+# Superseded build plan
 
-The app name remains undecided. This is the authoritative product-scope plan.
+> **Do not use this document for new implementation work.** It was superseded on
+> 2026-09-21 by [`ATHERA_JARVIS_BUILD_PLAN.md`](ATHERA_JARVIS_BUILD_PLAN.md).
+> Athera remains Needle-local-first, but it is not large-local-chat-model-first. A
+> large offline model is never required for onboarding or normal use. This file
+> remains only as historical planning input.
+
+> **Historical note**: This plan assumed a large offline chat model as the primary
+> intelligence path. The authoritative plan correctly positions Needle as the
+> local-first reflex and cloud providers as the primary reasoning path. The build
+> sequence (E00-E12) was sound in principle but the dependency order and acceptance
+> gates have been superseded by the phase-based gates in the authoritative plan.
+
+# Offline-Capable Phone Companion (historical)
+
+The app name was undecided when this historical plan was written. This document is
+not authoritative for current product scope.
 `VERTICAL_SLICE_PLAN.md` defines implementation order and worker handoffs. Unique task
 IDs, owners, status, evidence and blockers live in TASK_INDEX.md; interfaces and
 checks live in INTEGRATION.md. Existing task, approval and cloud settings are

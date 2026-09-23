@@ -3,21 +3,27 @@ import {
   Cable,
   Check,
   Download,
+  Info,
   Search,
   Settings2,
   Trash2,
   Unplug,
 } from "lucide-react";
 import type {
+  BuildInfo,
   Capability,
+  ConnectionState,
+  CloudConnectionTest,
   OAuthAuthorizationStart,
+  OAuthAuthorizationPoll,
   Settings,
   Snapshot,
   Skill,
   Risk,
 } from "./types";
 import type { ModelStatus, PersonalMemory } from "./types";
-import { command } from "./service";
+import { command, getBuildInfo } from "./service";
+import { AdaptiveRulesSettings } from "./AdaptiveRules";
 
 type Act = (name: string, payload: unknown) => Promise<boolean>;
 export function Configuration({
@@ -50,6 +56,7 @@ export function Configuration({
   );
   const [callbackUrl, setCallbackUrl] = useState("");
   const [oauthError, setOauthError] = useState("");
+  const [oauthNotice, setOauthNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const run = async (command: string, payload: unknown) => {
     setBusy(true);
@@ -59,6 +66,38 @@ export function Configuration({
       setBusy(false);
     }
   };
+  useEffect(() => {
+    if (!oauthStart || oauthStart.authorization_url) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const status = await command<OAuthAuthorizationPoll>(
+          "poll_authorization",
+          { transaction_id: oauthStart.transaction_id },
+        );
+        if (!active) return;
+        if (status.state === "connected") {
+          setOauthStart(null);
+          setOauthNotice("Connected. Resuming your task.");
+          return;
+        }
+        timer = setTimeout(() => void poll(), 750);
+      } catch (error) {
+        if (!active) return;
+        setOauthStart(null);
+        setOauthNotice("");
+        setOauthError(
+          error instanceof Error ? error.message : "Authorization failed",
+        );
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [oauthStart]);
   async function addConnection() {
     const id = crypto.randomUUID();
     const authentication =
@@ -99,16 +138,25 @@ export function Configuration({
     }
     setBusy(true);
     setOauthError("");
+    setOauthNotice("");
     try {
       if (!(await act("save_mcp_connection", connection))) return;
-      const start = await command<OAuthAuthorizationStart>("start_mcp_oauth", {
-        connection_id: id,
-        client_id: oauthClientId || null,
-        client_metadata_url: clientMetadataUrl || null,
-        redirect_uri: redirectUri,
-        resume_task_id: null,
-      });
+      const start = await command<OAuthAuthorizationStart>(
+        "authorize_connection",
+        {
+          connection_id: id,
+          client_id: oauthClientId || null,
+          client_metadata_url: clientMetadataUrl || null,
+          redirect_uri: redirectUri,
+          resume_task_id: null,
+        },
+      );
       setOauthStart(start);
+      setOauthNotice(
+        start.authorization_url
+          ? "Authorization is ready in your browser."
+          : "Secure sign-in opened. Return here when finished.",
+      );
     } catch (error) {
       setOauthError(
         error instanceof Error
@@ -171,6 +219,29 @@ export function Configuration({
               {(connection.authentication === "none" ||
                 connection.authentication.kind === "none") && (
                 <span className="badge green">Anonymous</span>
+              )}
+              {connectionState(snapshot.connections, connection.id) && (
+                <>
+                  <span
+                    className={
+                      "badge " +
+                      (connectionState(snapshot.connections, connection.id)
+                        ?.state === "connected"
+                        ? "green"
+                        : "amber")
+                    }
+                  >
+                    {connectionStateLabel(
+                      connectionState(snapshot.connections, connection.id)!,
+                    )}
+                  </span>
+                  <small>
+                    {
+                      connectionState(snapshot.connections, connection.id)
+                        ?.message
+                    }
+                  </small>
+                </>
               )}
             </div>
             <button
@@ -321,6 +392,11 @@ export function Configuration({
               {oauthError}
             </p>
           )}
+          {oauthNotice && (
+            <p className="field-help" aria-live="polite">
+              {oauthNotice}
+            </p>
+          )}
           {oauthStart && (
             <section className="connection-preset" aria-live="polite">
               <div>
@@ -331,40 +407,62 @@ export function Configuration({
                     "No scopes requested"}
                 </small>
               </div>
-              <a
-                className="primary"
-                href={oauthStart.authorization_url}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Open secure sign-in
-              </a>
-              <label>
-                Callback URL
-                <input
-                  type="url"
-                  value={callbackUrl}
-                  onChange={(event) => setCallbackUrl(event.target.value)}
-                  placeholder="Used only if automatic app return is unavailable"
-                />
-              </label>
+              {oauthStart.authorization_url && (
+                <>
+                  <a
+                    className="primary"
+                    href={oauthStart.authorization_url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open secure sign-in
+                  </a>
+                  <label>
+                    Callback URL
+                    <input
+                      type="url"
+                      value={callbackUrl}
+                      onChange={(event) => setCallbackUrl(event.target.value)}
+                      placeholder="Used only if automatic app return is unavailable"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={!callbackUrl || busy}
+                    onClick={async () => {
+                      if (
+                        await run("complete_mcp_oauth", {
+                          transaction_id: oauthStart.transaction_id,
+                          callback_url: callbackUrl,
+                        })
+                      ) {
+                        setOauthStart(null);
+                        setCallbackUrl("");
+                        setOauthNotice("Connected.");
+                      }
+                    }}
+                  >
+                    Complete authorization
+                  </button>
+                </>
+              )}
               <button
                 type="button"
                 className="secondary"
-                disabled={!callbackUrl || busy}
+                disabled={busy}
                 onClick={async () => {
                   if (
-                    await run("complete_mcp_oauth", {
+                    await run("cancel_authorization", {
                       transaction_id: oauthStart.transaction_id,
-                      callback_url: callbackUrl,
                     })
                   ) {
                     setOauthStart(null);
-                    setCallbackUrl("");
+                    setOauthNotice("Authorization cancelled.");
                   }
                 }}
               >
-                Complete authorization
+                Cancel sign-in
               </button>
             </section>
           )}
@@ -387,7 +485,7 @@ export function Configuration({
     <section className="page">
       <h2>Settings</h2>
       <div className="tabs" role="tablist" aria-label="Settings sections">
-        {["models", "memory", "tools", "skills"].map((t) => (
+        {["models", "memory", "rules", "tools", "skills", "diagnostics"].map((t) => (
           <button
             key={t}
             role="tab"
@@ -408,6 +506,13 @@ export function Configuration({
         />
       ) : tab === "memory" ? (
         <MemorySettings />
+      ) : tab === "rules" ? (
+        <AdaptiveRulesSettings
+          proposals={snapshot.rule_proposals ?? []}
+          rules={snapshot.adaptive_rules ?? []}
+        />
+      ) : tab === "diagnostics" ? (
+        <DiagnosticsTab snapshot={snapshot} />
       ) : (
         <>
           <div className="search-row">
@@ -558,6 +663,28 @@ function ModelSettings({
   );
   const [busy, setBusy] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [test, setTest] = useState<CloudConnectionTest | null>(null);
+
+  async function testConnection() {
+    setBusy(true);
+    setTest(null);
+    try {
+      setTest(
+        await command<CloudConnectionTest>("test_cloud_provider", {
+          cloud,
+          api_key: apiKey || null,
+        }),
+      );
+    } catch {
+      setTest({
+        state: "unavailable",
+        message:
+          "The configuration test could not start. Check the settings and try again.",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
   return (
     <>
       <LocalModelSettings />
@@ -627,13 +754,13 @@ function ModelSettings({
           />
         </label>
         <label>
-          API key (until backend restart)
+          API key (stored securely on this device)
           <input
             type="password"
             autoComplete="off"
             spellCheck={false}
             maxLength={8192}
-            placeholder={sessionKey ? "Session key set" : "Enter API key"}
+            placeholder={sessionKey ? "Secure key stored" : "Enter API key"}
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
           />
@@ -652,7 +779,7 @@ function ModelSettings({
               }
             }}
           >
-            <Trash2 size={17} /> Clear session key
+            <Trash2 size={17} /> Remove stored key
           </button>
         )}
         <details>
@@ -672,6 +799,24 @@ function ModelSettings({
             />
           </label>
         </details>
+        <button
+          className="secondary"
+          type="button"
+          disabled={busy}
+          onClick={() => void testConnection()}
+        >
+          {busy ? "Testing..." : "Test connection"}
+        </button>
+        {test && (
+          <p
+            role="status"
+            className={
+              test.state === "connected" ? "field-help" : "inline-error"
+            }
+          >
+            {test.message}
+          </p>
+        )}
         <button className="primary" disabled={busy}>
           <Check size={17} />
           {busy ? "Saving..." : "Save provider"}
@@ -739,7 +884,7 @@ function LocalModelSettings() {
     <section className="local-model" aria-labelledby="local-model-title">
       <div className="model-status">
         <div>
-          <h3 id="local-model-title">Local conversation model</h3>
+          <h3 id="local-model-title">Optional offline conversation model</h3>
           <small aria-live="polite">
             {status
               ? (installationLabel ?? availabilityLabel(status.availability))
@@ -965,6 +1110,46 @@ function MemorySettings() {
   );
 }
 
+function DiagnosticsTab({ snapshot }: { snapshot: Snapshot }) {
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
+  useEffect(() => {
+    void getBuildInfo().then(setBuildInfo);
+  }, []);
+  return (
+    <section className="settings-form">
+      <h3>
+        <Info size={16} style={{ verticalAlign: "middle", marginRight: 6 }} />
+        Developer Diagnostics
+      </h3>
+      <dl>
+        <dt>Version</dt>
+        <dd>{buildInfo?.version ?? "unknown"}</dd>
+        <dt>Git commit</dt>
+        <dd>
+          {buildInfo?.git_hash ?? "unknown"}
+          {buildInfo?.git_dirty ? " (dirty)" : ""}
+        </dd>
+        <dt>Build time</dt>
+        <dd>
+          {buildInfo
+            ? new Date(buildInfo.build_timestamp * 1000).toLocaleString()
+            : "unknown"}
+        </dd>
+        <dt>Needle</dt>
+        <dd>{snapshot.needle}</dd>
+        <dt>Cloud credential</dt>
+        <dd>{snapshot.cloud_credential}</dd>
+        <dt>Voice</dt>
+        <dd>{snapshot.voice}</dd>
+        <dt>Capabilities</dt>
+        <dd>{snapshot.capabilities.length}</dd>
+        <dt>Tasks</dt>
+        <dd>{snapshot.tasks.length}</dd>
+      </dl>
+    </section>
+  );
+}
+
 function availabilityLabel(value: ModelStatus["availability"]) {
   return {
     missing_model: "Model not downloaded",
@@ -978,4 +1163,22 @@ function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024 * 1024)
     return (bytes / 1024 / 1024).toFixed(1) + " MB";
   return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+}
+
+function connectionState(states: ConnectionState[], id: string) {
+  return states.find((state) => state.connection_id === id);
+}
+
+function connectionStateLabel(connection: ConnectionState) {
+  return {
+    connected: "Connected",
+    required: "Authorization required",
+    connecting: "Connecting",
+    refreshing: "Refreshing",
+    expired: "Expired",
+    step_up_required: "More access required",
+    denied: "Denied",
+    revoked: "Revoked",
+    unavailable: "Unavailable",
+  }[connection.state];
 }

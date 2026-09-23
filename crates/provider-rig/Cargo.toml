@@ -1,18 +1,16 @@
 [package]
-name = "assistant-contracts"
+name = "provider-rig"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+assistant-contracts.workspace = true
+rig-core = { version = "0.42", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
 async-trait.workspace = true
-sha2.workspace = true
-base64.workspace = true
-hmac.workspace = true
-getrandom.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

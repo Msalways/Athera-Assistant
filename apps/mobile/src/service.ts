@@ -1,4 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { BuildInfo } from "./types";
+
 export async function command<T>(
   name: string,
   payload: unknown = {},
@@ -15,4 +17,15 @@ export async function command<T>(
   const body = await response.json();
   if (!response.ok) throw new Error(body.error || "Request failed");
   return body as T;
+}
+
+export async function getBuildInfo(): Promise<BuildInfo | null> {
+  if (isTauri()) {
+    try {
+      return await invoke<BuildInfo>("build_info");
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }

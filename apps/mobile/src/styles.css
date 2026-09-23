@@ -126,10 +126,14 @@ button {
   width: 42px;
   height: 42px;
   border-radius: 8px;
-  background: var(--soft);
-  color: var(--accent);
+  background: #090b12;
   display: grid;
   place-items: center;
+}
+.app-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 .header-actions {
   margin-left: auto;
@@ -188,25 +192,6 @@ main {
 .toolbar-actions {
   display: flex;
   gap: 12px;
-}
-.mode-switcher {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  margin: 10px 20px 0;
-  padding: 3px;
-  border-radius: 8px;
-  background: var(--soft);
-}
-.mode-switcher button {
-  min-height: 40px;
-  border-radius: 6px;
-  color: var(--muted);
-  font-size: 13px;
-}
-.mode-switcher button[aria-pressed="true"] {
-  background: var(--surface);
-  color: var(--ink);
-  box-shadow: 0 1px 4px #0001;
 }
 .empty-conversation {
   min-height: calc(100dvh - 350px);
@@ -776,6 +761,29 @@ summary svg {
 .execution-events li span {
   margin-right: 8px;
   color: var(--ink);
+}
+.worker-activity {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0 !important;
+}
+.worker-activity li {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.auth-required {
+  margin-top: 12px;
+  padding: 14px;
+  border-left: 3px solid #bb914b;
+  background: var(--soft);
+}
+.auth-required p {
+  margin: 0 0 12px;
+  line-height: 1.5;
 }
 .connection-row {
   display: flex;
