@@ -551,6 +551,12 @@ Completed since the 2026-09-23 audit (all GNU-toolchain verified):
 - Gradle packaging fix: `syncFrontendAssets` now orders before `preBuild`
   instead of naming only the asset-merge task, covering lint-model and
   future consumers of the synced assets directory.
+- Needle gap closure (`provider-needle`, per `docs/NEEDLE_INTEGRATION_PLAN.md`):
+  confidence-gated escalation (0.70 initial, uncalibrated, fail-closed on
+  missing/NaN), empty-call refusal and ungrounded values map to recoverable
+  `Handoff` instead of error/execution, UTC date fact in the system prompt,
+  and the envelope interpreter extracted as pure `decide_action` (13 tests,
+  no native library required).
 
 Still open (device or user input required):
 - Wire deterministic requirements/routing into the single submit path and let
