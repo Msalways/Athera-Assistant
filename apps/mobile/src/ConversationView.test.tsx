@@ -134,7 +134,7 @@ it("explains download, verification, failure, and bridge-offline setup states", 
     screen.getByText("The model download failed: Network lost"),
   ).toBeVisible();
   expect(
-    screen.getByRole("button", { name: "Retry local model setup" }),
+    screen.getByRole("button", { name: "Retry offline chat setup" }),
   ).toBeVisible();
 
   rerender(

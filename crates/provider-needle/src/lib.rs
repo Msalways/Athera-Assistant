@@ -111,6 +111,9 @@ impl ModelProvider for NeedleProvider {
             local: true,
         }
     }
+    fn is_available(&self) -> bool {
+        self.native.is_some()
+    }
     async fn infer(&self, context: ContextBundle) -> Result<AgentAction> {
         let native = self.native.clone().ok_or(Error::Unavailable)?;
         tokio::task::spawn_blocking(move || {
@@ -168,8 +171,18 @@ impl ModelProvider for NeedleProvider {
 }
 
 fn local_functions(context: &ContextBundle) -> Vec<Value> {
-    let mut functions = protocol::functions(context);
-    functions.pop();
+    // The fast local model may choose a scoped capability or hand off, but it
+    // must not receive cloud-planning or personalization authoring controls.
+    // Filter by the stable public name rather than trimming a position from
+    // the shared protocol list: new planner-only functions must stay hidden.
+    let mut functions: Vec<_> = protocol::functions(context)
+        .into_iter()
+        .filter(|function| {
+            function["name"]
+                .as_str()
+                .is_some_and(|name| name == "capabilities_search" || name.starts_with("tool_"))
+        })
+        .collect();
     functions.push(serde_json::json!({"name":"request_assistance","description":"Ask a reasoning model for help with a complex or ambiguous request.","parameters":{"type":"object","properties":{"reason":{"type":"string"}},"required":["reason"],"additionalProperties":false}}));
     functions
 }
@@ -187,6 +200,10 @@ fn working_packet(context: &ContextBundle) -> Result<String> {
     for skill in &context.skills {
         packet.push_str("\nScoped skill guidance:\n");
         packet.push_str(&skill.instructions);
+    }
+    for rule in &context.adaptive_rules {
+        packet.push_str("\nUser-approved preference (not permission):\n");
+        packet.push_str(&rule.instruction);
     }
     Ok(packet)
 }
@@ -207,6 +224,7 @@ mod tests {
             skills: vec![],
             candidates: vec![],
             tools: vec![],
+            adaptive_rules: vec![],
         };
         assert_eq!(working_packet(&context).unwrap(), "turn the flashlight on");
         assert!(!local_functions(&context)

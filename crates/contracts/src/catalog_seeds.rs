@@ -82,12 +82,27 @@ fn base_url_field(required: bool, help: &str) -> ConfigFieldSpec {
     }
 }
 
+fn model_field(help: &str) -> ConfigFieldSpec {
+    ConfigFieldSpec {
+        id: "model".into(),
+        label: "Model".into(),
+        kind: ConfigFieldKind::Text,
+        required: true,
+        secret: false,
+        validation: None,
+        options: vec![],
+        visible_when: vec![],
+        help_text: Some(help.into()),
+    }
+}
+
 fn openai_shaped(
     id: &str,
     display: &str,
     docs: &str,
     vision: bool,
     max_context: Option<u32>,
+    default_base_url: Option<&str>,
 ) -> ProviderDefinition {
     ProviderDefinition {
         schema: PROVIDER_CATALOG_SCHEMA_V1.into(),
@@ -100,11 +115,15 @@ fn openai_shaped(
             vision,
             max_context_tokens: max_context,
         },
-        endpoint_fields: vec![base_url_field(false, "Override the default endpoint")],
+        endpoint_fields: vec![
+            base_url_field(default_base_url.is_none(), "Override the default endpoint"),
+            model_field("Model ID, e.g. the provider's chat model name"),
+        ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![api_key_option()],
         availability: ProviderAvailability::Available,
         documentation_url: Some(docs.into()),
+        default_base_url: default_base_url.map(str::to_owned),
     }
 }
 
@@ -120,14 +139,15 @@ pub fn openai_definition() -> ProviderDefinition {
             vision: true,
             max_context_tokens: Some(128_000),
         },
-        endpoint_fields: vec![base_url_field(
-            false,
-            "Defaults to https://api.openai.com/v1",
-        )],
+        endpoint_fields: vec![
+            base_url_field(false, "Defaults to https://api.openai.com/v1"),
+            model_field("Model ID, e.g. gpt-4o"),
+        ],
         model_source: ModelSource::Catalog,
         auth_options: vec![api_key_option()],
         availability: ProviderAvailability::Available,
         documentation_url: Some("https://platform.openai.com/docs".into()),
+        default_base_url: Some("https://api.openai.com/v1".into()),
     }
 }
 
@@ -154,17 +174,20 @@ pub fn openai_compatible_definition() -> ProviderDefinition {
             vision: false,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![ConfigFieldSpec {
-            id: "base_url".into(),
-            label: "Base URL".into(),
-            kind: ConfigFieldKind::Url,
-            required: true,
-            secret: false,
-            validation: None,
-            options: vec![],
-            visible_when: vec![],
-            help_text: Some("Custom OpenAI-compatible endpoint".into()),
-        }],
+        endpoint_fields: vec![
+            ConfigFieldSpec {
+                id: "base_url".into(),
+                label: "Base URL".into(),
+                kind: ConfigFieldKind::Url,
+                required: true,
+                secret: false,
+                validation: None,
+                options: vec![],
+                visible_when: vec![],
+                help_text: Some("Custom OpenAI-compatible endpoint".into()),
+            },
+            model_field("Model ID served by the custom endpoint"),
+        ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![
             AuthOptionSpec {
@@ -231,6 +254,7 @@ pub fn openai_compatible_definition() -> ProviderDefinition {
         ],
         availability: ProviderAvailability::Available,
         documentation_url: None,
+        default_base_url: None,
     }
 }
 
@@ -246,14 +270,15 @@ pub fn nvidia_definition() -> ProviderDefinition {
             vision: false,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![base_url_field(
-            false,
-            "Defaults to https://integrate.api.nvidia.com/v1",
-        )],
+        endpoint_fields: vec![
+            base_url_field(false, "Defaults to https://integrate.api.nvidia.com/v1"),
+            model_field("NIM model ID, e.g. meta/llama-3.1-8b-instruct"),
+        ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![api_key_option()],
         availability: ProviderAvailability::Available,
         documentation_url: Some("https://docs.api.nvidia.com/nim".into()),
+        default_base_url: Some("https://integrate.api.nvidia.com/v1".into()),
     }
 }
 
@@ -269,11 +294,127 @@ pub fn anthropic_definition() -> ProviderDefinition {
             vision: true,
             max_context_tokens: Some(200_000),
         },
-        endpoint_fields: vec![],
+        endpoint_fields: vec![model_field("Model ID, e.g. claude-sonnet-4-5")],
         model_source: ModelSource::Catalog,
         auth_options: vec![anthropic_key_option()],
         availability: ProviderAvailability::Available,
         documentation_url: Some("https://docs.anthropic.com".into()),
+        default_base_url: Some("https://api.anthropic.com".into()),
+    }
+}
+
+pub fn anthropic_compatible_definition() -> ProviderDefinition {
+    let secret_field = |id: &str, label: &str| ConfigFieldSpec {
+        id: id.into(),
+        label: label.into(),
+        kind: ConfigFieldKind::Secret,
+        required: true,
+        secret: true,
+        validation: None,
+        options: vec![],
+        visible_when: vec![],
+        help_text: None,
+    };
+    ProviderDefinition {
+        schema: PROVIDER_CATALOG_SCHEMA_V1.into(),
+        id: "anthropic-compatible".into(),
+        display_name: "Anthropic-Compatible (Custom)".into(),
+        transport_family: TransportFamily::AnthropicCompatible,
+        capabilities: ProviderCapabilities {
+            streaming: true,
+            tool_calls: true,
+            vision: false,
+            max_context_tokens: None,
+        },
+        endpoint_fields: vec![
+            ConfigFieldSpec {
+                id: "base_url".into(),
+                label: "Base URL".into(),
+                kind: ConfigFieldKind::Url,
+                required: true,
+                secret: false,
+                validation: None,
+                options: vec![],
+                visible_when: vec![],
+                help_text: Some("Custom Anthropic-compatible endpoint".into()),
+            },
+            ConfigFieldSpec {
+                id: "api_version".into(),
+                label: "API Version".into(),
+                kind: ConfigFieldKind::Text,
+                required: false,
+                secret: false,
+                validation: None,
+                options: vec![],
+                visible_when: vec![],
+                help_text: Some("Defaults to 2023-06-01".into()),
+            },
+            model_field("Model ID served by the custom endpoint"),
+        ],
+        model_source: ModelSource::UserSpecified,
+        auth_options: vec![
+            AuthOptionSpec {
+                id: "api_key".into(),
+                label: "API Key".into(),
+                auth_kind: AuthKind::ApiKey,
+                fields: vec![secret_field("api_key", "API Key")],
+                expiry_behavior: ExpiryBehavior::NeverExpires,
+                refresh_behavior: RefreshBehavior::NotRefreshable,
+                android_support: AndroidSupport::FullySupported,
+                wire_header: Some("x-api-key".into()),
+                wire_prefix: None,
+                extra_headers: vec![HeaderPair {
+                    name: "anthropic-version".into(),
+                    value: "2023-06-01".into(),
+                }],
+            },
+            AuthOptionSpec {
+                id: "bearer".into(),
+                label: "Bearer Token".into(),
+                auth_kind: AuthKind::BearerToken,
+                fields: vec![secret_field("token", "Bearer Token")],
+                expiry_behavior: ExpiryBehavior::NeverExpires,
+                refresh_behavior: RefreshBehavior::NotRefreshable,
+                android_support: AndroidSupport::FullySupported,
+                wire_header: Some("authorization".into()),
+                wire_prefix: Some("Bearer ".into()),
+                extra_headers: vec![HeaderPair {
+                    name: "anthropic-version".into(),
+                    value: "2023-06-01".into(),
+                }],
+            },
+            AuthOptionSpec {
+                id: "custom_header".into(),
+                label: "Custom Header".into(),
+                auth_kind: AuthKind::CustomCompatible,
+                fields: vec![
+                    ConfigFieldSpec {
+                        id: "header_name".into(),
+                        label: "Header Name".into(),
+                        kind: ConfigFieldKind::Text,
+                        required: true,
+                        secret: false,
+                        validation: None,
+                        options: vec![],
+                        visible_when: vec![],
+                        help_text: None,
+                    },
+                    secret_field("header_value", "Header Value"),
+                ],
+                expiry_behavior: ExpiryBehavior::NeverExpires,
+                refresh_behavior: RefreshBehavior::NotRefreshable,
+                android_support: AndroidSupport::FullySupported,
+                wire_header: None,
+                wire_prefix: None,
+                extra_headers: vec![HeaderPair {
+                    name: "anthropic-version".into(),
+                    value: "2023-06-01".into(),
+                }],
+            },
+        ],
+        availability: ProviderAvailability::Available,
+        documentation_url: None,
+        default_base_url: None,
     }
 }
 
@@ -313,6 +454,7 @@ pub fn azure_definition() -> ProviderDefinition {
         auth_options: vec![azure_key_option()],
         availability: ProviderAvailability::Available,
         documentation_url: Some("https://learn.microsoft.com/azure/ai-services/openai".into()),
+        default_base_url: None,
     }
 }
 
@@ -328,11 +470,12 @@ pub fn gemini_definition() -> ProviderDefinition {
             vision: true,
             max_context_tokens: Some(1_000_000),
         },
-        endpoint_fields: vec![],
+        endpoint_fields: vec![model_field("Model ID, e.g. gemini-2.0-flash")],
         model_source: ModelSource::Catalog,
         auth_options: vec![google_key_option()],
         availability: ProviderAvailability::Available,
         documentation_url: Some("https://ai.google.dev/gemini-api/docs".into()),
+        default_base_url: Some("https://generativelanguage.googleapis.com/v1beta".into()),
     }
 }
 
@@ -348,17 +491,20 @@ pub fn bedrock_definition() -> ProviderDefinition {
             vision: true,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![ConfigFieldSpec {
-            id: "region".into(),
-            label: "AWS Region".into(),
-            kind: ConfigFieldKind::Text,
-            required: true,
-            secret: false,
-            validation: None,
-            options: vec![],
-            visible_when: vec![],
-            help_text: Some("Bedrock region like us-east-1".into()),
-        }],
+        endpoint_fields: vec![
+            ConfigFieldSpec {
+                id: "region".into(),
+                label: "AWS Region".into(),
+                kind: ConfigFieldKind::Text,
+                required: true,
+                secret: false,
+                validation: None,
+                options: vec![],
+                visible_when: vec![],
+                help_text: Some("Bedrock region like us-east-1".into()),
+            },
+            model_field("Bedrock model ID"),
+        ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![
             AuthOptionSpec {
@@ -437,6 +583,7 @@ pub fn bedrock_definition() -> ProviderDefinition {
         ],
         availability: ProviderAvailability::DisabledByFeature,
         documentation_url: Some("https://docs.aws.amazon.com/bedrock".into()),
+        default_base_url: None,
     }
 }
 
@@ -475,6 +622,7 @@ pub fn vertex_definition() -> ProviderDefinition {
                 visible_when: vec![],
                 help_text: None,
             },
+            model_field("Vertex model ID"),
         ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![AuthOptionSpec {
@@ -491,6 +639,7 @@ pub fn vertex_definition() -> ProviderDefinition {
         }],
         availability: ProviderAvailability::DisabledByFeature,
         documentation_url: Some("https://cloud.google.com/vertex-ai".into()),
+        default_base_url: None,
     }
 }
 
@@ -506,10 +655,10 @@ pub fn ollama_definition() -> ProviderDefinition {
             vision: false,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![base_url_field(
-            false,
-            "Defaults to http://localhost:11434/v1",
-        )],
+        endpoint_fields: vec![
+            base_url_field(false, "Defaults to http://localhost:11434/v1"),
+            model_field("Ollama model tag, e.g. llama3.1"),
+        ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![AuthOptionSpec {
             id: "none".into(),
@@ -525,6 +674,7 @@ pub fn ollama_definition() -> ProviderDefinition {
         }],
         availability: ProviderAvailability::Available,
         documentation_url: Some("https://ollama.com".into()),
+        default_base_url: Some("http://localhost:11434/v1".into()),
     }
 }
 
@@ -540,7 +690,7 @@ pub fn chatgpt_definition() -> ProviderDefinition {
             vision: false,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![],
+        endpoint_fields: vec![model_field("ChatGPT model")],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![AuthOptionSpec {
             id: "oauth".into(),
@@ -556,6 +706,7 @@ pub fn chatgpt_definition() -> ProviderDefinition {
         }],
         availability: ProviderAvailability::DisabledByFeature,
         documentation_url: Some("https://help.openai.com".into()),
+        default_base_url: Some("https://api.openai.com/v1".into()),
     }
 }
 
@@ -571,7 +722,7 @@ pub fn copilot_definition() -> ProviderDefinition {
             vision: false,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![],
+        endpoint_fields: vec![model_field("Copilot model")],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![AuthOptionSpec {
             id: "oauth".into(),
@@ -590,11 +741,19 @@ pub fn copilot_definition() -> ProviderDefinition {
         }],
         availability: ProviderAvailability::DisabledByFeature,
         documentation_url: Some("https://docs.github.com/copilot".into()),
+        default_base_url: Some("https://api.githubcopilot.com".into()),
     }
 }
 
 pub fn cohere_definition() -> ProviderDefinition {
-    let mut definition = openai_shaped("cohere", "Cohere", "https://docs.cohere.com", false, None);
+    let mut definition = openai_shaped(
+        "cohere",
+        "Cohere",
+        "https://docs.cohere.com",
+        false,
+        None,
+        Some("https://api.cohere.com/compatibility/v1"),
+    );
     definition.transport_family = TransportFamily::Custom;
     definition.display_name = "Cohere (Native)".into();
     definition.availability = ProviderAvailability::DisabledByFeature;
@@ -613,10 +772,10 @@ pub fn llamacpp_definition() -> ProviderDefinition {
             vision: false,
             max_context_tokens: None,
         },
-        endpoint_fields: vec![base_url_field(
-            false,
-            "Defaults to http://localhost:8080/v1 (llama-server)",
-        )],
+        endpoint_fields: vec![
+            base_url_field(false, "Defaults to http://localhost:8080/v1 (llama-server)"),
+            model_field("llama-server model alias"),
+        ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![AuthOptionSpec {
             id: "none".into(),
@@ -632,6 +791,7 @@ pub fn llamacpp_definition() -> ProviderDefinition {
         }],
         availability: ProviderAvailability::DisabledByFeature,
         documentation_url: Some("https://github.com/ggerganov/llama.cpp".into()),
+        default_base_url: Some("http://localhost:8080/v1".into()),
     }
 }
 
@@ -642,6 +802,7 @@ pub fn voyage_definition() -> ProviderDefinition {
         "https://docs.voyageai.com",
         false,
         None,
+        Some("https://api.voyageai.com/v1"),
     );
     definition.display_name = "Voyage AI (Embeddings)".into();
     definition.capabilities.tool_calls = false;
@@ -658,14 +819,23 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://api-docs.deepseek.com",
             false,
             None,
+            Some("https://api.deepseek.com/v1"),
         ),
-        ("groq", "Groq", "https://console.groq.com/docs", false, None),
+        (
+            "groq",
+            "Groq",
+            "https://console.groq.com/docs",
+            false,
+            None,
+            Some("https://api.groq.com/openai/v1"),
+        ),
         (
             "mistral",
             "Mistral",
             "https://docs.mistral.ai",
             true,
             Some(128_000),
+            Some("https://api.mistral.ai/v1"),
         ),
         (
             "together",
@@ -673,6 +843,7 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://docs.together.ai",
             true,
             Some(128_000),
+            Some("https://api.together.xyz/v1"),
         ),
         (
             "openrouter",
@@ -680,6 +851,7 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://openrouter.ai/docs",
             true,
             None,
+            Some("https://openrouter.ai/api/v1"),
         ),
         (
             "perplexity",
@@ -687,14 +859,23 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://docs.perplexity.ai",
             false,
             None,
+            Some("https://api.perplexity.ai"),
         ),
-        ("xai", "xAI", "https://docs.x.ai", true, Some(128_000)),
+        (
+            "xai",
+            "xAI",
+            "https://docs.x.ai",
+            true,
+            Some(128_000),
+            Some("https://api.x.ai/v1"),
+        ),
         (
             "huggingface",
             "Hugging Face",
             "https://huggingface.co/docs",
             false,
             None,
+            Some("https://router.huggingface.co/v1"),
         ),
         (
             "hyperbolic",
@@ -702,6 +883,7 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://docs.hyperbolic.xyz",
             false,
             None,
+            Some("https://api.hyperbolic.xyz/v1"),
         ),
         (
             "minimax",
@@ -709,6 +891,7 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://platform.minimaxi.com",
             false,
             None,
+            Some("https://api.minimaxi.com/v1"),
         ),
         (
             "moonshot",
@@ -716,29 +899,55 @@ fn bulk_openai_shaped() -> Vec<ProviderDefinition> {
             "https://platform.moonshot.ai/docs",
             false,
             None,
+            Some("https://api.moonshot.ai/v1"),
         ),
-        ("venice", "Venice", "https://docs.venice.ai", false, None),
+        (
+            "venice",
+            "Venice",
+            "https://docs.venice.ai",
+            false,
+            None,
+            Some("https://api.venice.ai/api/v1"),
+        ),
         (
             "xiaomimimo",
             "Xiaomi MiMo",
             "https://platform.mimo.ai",
             false,
             None,
+            None,
         ),
-        ("zai", "Z.ai", "https://docs.z.ai", false, None),
-        ("mira", "Mira", "https://docs.mira.network", false, None),
+        (
+            "zai",
+            "Z.ai",
+            "https://docs.z.ai",
+            false,
+            None,
+            Some("https://open.bigmodel.cn/api/paas/v4"),
+        ),
+        (
+            "mira",
+            "Mira",
+            "https://docs.mira.network",
+            false,
+            None,
+            None,
+        ),
         (
             "doubleword",
             "Doubleword",
             "https://docs.doubleword.ai",
             false,
             None,
+            None,
         ),
     ]
     .into_iter()
-    .map(|(id, display, docs, vision, max_context)| {
-        openai_shaped(id, display, docs, vision, max_context)
-    })
+    .map(
+        |(id, display, docs, vision, max_context, default_base_url)| {
+            openai_shaped(id, display, docs, vision, max_context, default_base_url)
+        },
+    )
     .collect()
 }
 
@@ -748,6 +957,7 @@ pub fn default_catalog() -> Result<ProviderCatalog, CatalogError> {
     catalog.register(openai_compatible_definition())?;
     catalog.register(nvidia_definition())?;
     catalog.register(anthropic_definition())?;
+    catalog.register(anthropic_compatible_definition())?;
     catalog.register(azure_definition())?;
     catalog.register(gemini_definition())?;
     catalog.register(ollama_definition())?;
@@ -778,6 +988,7 @@ mod tests {
             "openai-compatible",
             "nvidia-nim",
             "anthropic",
+            "anthropic-compatible",
             "azure-openai",
             "gemini",
             "ollama",
@@ -807,7 +1018,7 @@ mod tests {
         ] {
             assert!(catalog.get(id).is_some(), "missing provider {id}");
         }
-        assert_eq!(catalog.providers.len(), 30);
+        assert_eq!(catalog.providers.len(), 31);
     }
 
     #[test]
@@ -841,6 +1052,38 @@ mod tests {
             definition.transport_family,
             TransportFamily::AnthropicCompatible
         );
+    }
+
+    #[test]
+    fn anthropic_compatible_covers_key_bearer_and_custom_header() {
+        let definition = anthropic_compatible_definition();
+        definition.validate().unwrap();
+        assert_eq!(
+            definition.transport_family,
+            TransportFamily::AnthropicCompatible
+        );
+        assert_eq!(definition.model_source, ModelSource::UserSpecified);
+        assert!(definition
+            .endpoint_fields
+            .iter()
+            .any(|field| field.id == "base_url" && field.required));
+        let kinds: Vec<AuthKind> = definition
+            .auth_options
+            .iter()
+            .map(|option| option.auth_kind)
+            .collect();
+        assert!(kinds.contains(&AuthKind::ApiKey));
+        assert!(kinds.contains(&AuthKind::BearerToken));
+        assert!(kinds.contains(&AuthKind::CustomCompatible));
+        for option in &definition.auth_options {
+            assert!(
+                option.extra_headers.iter().any(
+                    |header| header.name == "anthropic-version" && header.value == "2023-06-01"
+                ),
+                "missing version header on {}",
+                option.id
+            );
+        }
     }
 
     #[test]
@@ -925,7 +1168,7 @@ mod tests {
         let json = serde_json::to_string(&catalog).unwrap();
         let lower = json.to_lowercase();
         assert!(json.contains(PROVIDER_CATALOG_REGISTRY_V1));
-        assert_eq!(catalog.providers.len(), 30);
+        assert_eq!(catalog.providers.len(), 31);
         for marker in ["\"sk-\"", "bearer sk-"] {
             assert!(!lower.contains(marker), "snapshot leaks {marker}");
         }
@@ -987,6 +1230,58 @@ mod tests {
         assert_eq!(
             definition.availability,
             ProviderAvailability::DisabledByFeature
+        );
+    }
+
+    #[test]
+    fn every_definition_resolves_endpoint_and_model_shape() {
+        use crate::provider::{normalize_endpoint, resolve_model};
+        let catalog = default_catalog().unwrap();
+        for provider in &catalog.providers {
+            provider.validate().unwrap();
+            let model_field = provider
+                .endpoint_fields
+                .iter()
+                .find(|field| field.id == "model");
+            if provider.id == "azure-openai" {
+                assert!(
+                    provider
+                        .endpoint_fields
+                        .iter()
+                        .any(|field| field.id == "deployment" && field.required),
+                    "azure must keep its deployment field"
+                );
+                continue;
+            }
+            assert!(
+                model_field.is_some_and(|field| field.required),
+                "{} must carry a required model field",
+                provider.id
+            );
+            let has_base = provider.default_base_url.is_some()
+                || provider.endpoint_fields.iter().any(|field| {
+                    matches!(
+                        field.id.as_str(),
+                        "base_url" | "endpoint" | "region" | "project"
+                    )
+                });
+            assert!(has_base, "{} must carry an endpoint field", provider.id);
+            if provider.availability == ProviderAvailability::Available {
+                assert!(
+                    normalize_endpoint(None, provider.default_base_url.as_deref()).is_ok()
+                        || provider
+                            .endpoint_fields
+                            .iter()
+                            .any(|field| (field.id == "base_url" || field.id == "endpoint")
+                                && field.required),
+                    "{} must be usable without stored config",
+                    provider.id
+                );
+            }
+        }
+        assert_eq!(
+            resolve_model(&serde_json::json!({"model": "gpt-4o"})),
+            Ok("gpt-4o".into())
         );
     }
 }

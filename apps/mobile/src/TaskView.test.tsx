@@ -48,7 +48,9 @@ describe("TaskView", () => {
         act={act}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry after connecting" }),
+    );
     expect(act).toHaveBeenCalledWith("resume_auth", { task_id: task.id });
   });
   it("shows exact action and submits its approval ID", () => {
@@ -165,6 +167,9 @@ describe("TaskView", () => {
       />,
     );
     expect(screen.getByText("Hello from the model.")).toBeVisible();
+    expect(
+      screen.getByRole("list", { name: "Worker activity" }),
+    ).toHaveTextContent("Worker 1Running");
   });
   it("renders retrieved sources as safe source cards", () => {
     render(

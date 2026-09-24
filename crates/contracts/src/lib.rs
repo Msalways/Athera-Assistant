@@ -19,14 +19,18 @@ pub mod credential_metadata;
 pub mod discovery;
 pub mod events;
 pub mod factory;
+pub mod failover;
 pub mod graph;
 pub mod identity;
+pub mod jobs;
 pub mod lifecycle;
 pub mod local_response;
 pub mod model;
 pub mod oauth;
 pub mod output;
 pub mod personalization;
+pub mod policy;
+pub mod preferences;
 pub mod protocol;
 pub mod provider;
 pub mod provider_health;
@@ -48,6 +52,7 @@ pub use adaptive::*;
 pub use connection::*;
 pub use events::*;
 pub use graph::*;
+pub use jobs::*;
 pub use output::*;
 pub use tool_result::*;
 
@@ -445,6 +450,11 @@ pub trait Store: PersonalizationStore + Send + Sync {
     fn save_task_blocker(&self, task_id: Id, blocker: &TaskBlocker) -> Result<()>;
     fn task_blocker(&self, task_id: Id) -> Result<Option<TaskBlocker>>;
     fn delete_task_blocker(&self, task_id: Id) -> Result<()>;
+
+    // Durable job ledger (Phase 2)
+    fn save_job(&self, job: &DurableJob) -> Result<()>;
+    fn job(&self, id: &str) -> Result<Option<DurableJob>>;
+    fn due_jobs(&self, now_millis: u64) -> Result<Vec<DurableJob>>;
 }
 
 pub type AssistantEvent = RunEventEnvelope;

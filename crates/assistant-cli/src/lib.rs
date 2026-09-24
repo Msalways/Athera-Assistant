@@ -85,18 +85,22 @@ async fn evaluate(scenario: Value) -> Result<Value> {
     };
     let task = assistant.submit(input)?;
     let task = assistant.run(task.id).await?;
-    verify_expected(&scenario, &task)?;
+    let events = store.events(0)?;
     let results = task
         .result_refs
         .iter()
         .map(|id| store.result(*id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(
-        json!({"task":task,"events":store.events(0)?,"results":results,"mode":"deterministic_fixture"}),
-    )
+    verify_expected(&scenario, &task, &events, &results)?;
+    Ok(json!({"task":task,"events":events,"results":results,"mode":"deterministic_fixture"}))
 }
 
-fn verify_expected(scenario: &Value, task: &Task) -> Result<()> {
+fn verify_expected(
+    scenario: &Value,
+    task: &Task,
+    events: &[AssistantEvent],
+    results: &[Value],
+) -> Result<()> {
     let Some(expected) = scenario.get("expected") else {
         return Ok(());
     };
@@ -135,6 +139,88 @@ fn verify_expected(scenario: &Value, task: &Task) -> Result<()> {
             .collect::<Vec<_>>();
         actual.sort();
         if json!(actual) != *expected_urls {
+            return Err(Error::InvalidResponse);
+        }
+    }
+    if let Some(expected_count) = expected
+        .get("graph_completed_nodes")
+        .and_then(Value::as_u64)
+    {
+        let actual = task
+            .work_graph
+            .as_ref()
+            .map(|graph| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| node.state == WorkNodeState::Completed)
+                    .count() as u64
+            })
+            .unwrap_or_default();
+        if actual != expected_count {
+            return Err(Error::InvalidResponse);
+        }
+    }
+    if expected
+        .get("result_count")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| task.result_refs.len() as u64 != count)
+    {
+        return Err(Error::InvalidResponse);
+    }
+    let graph_worker_ids = task
+        .work_graph
+        .as_ref()
+        .map(|graph| {
+            graph
+                .nodes
+                .iter()
+                .map(|node| node.request.worker_id)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let graph_worker_events = events.iter().filter(|event| {
+        event
+            .worker_id
+            .is_some_and(|worker_id| graph_worker_ids.contains(&worker_id))
+    });
+    if let Some(expected_count) = expected.get("worker_started_count").and_then(Value::as_u64) {
+        let actual = graph_worker_events
+            .clone()
+            .filter(|event| event.kind == RunEventKind::WorkerStarted)
+            .count() as u64;
+        if actual != expected_count {
+            return Err(Error::InvalidResponse);
+        }
+    }
+    if let Some(expected_overlap) = expected.get("worker_overlap").and_then(Value::as_bool) {
+        let mut active = 0usize;
+        let mut max_active = 0usize;
+        for event in graph_worker_events {
+            match event.kind {
+                RunEventKind::WorkerStarted => {
+                    active += 1;
+                    max_active = max_active.max(active);
+                }
+                RunEventKind::WorkerTerminal => active = active.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if (max_active > 1) != expected_overlap {
+            return Err(Error::InvalidResponse);
+        }
+    }
+    if let Some(expected_results) = expected.get("result_texts") {
+        let actual = results
+            .iter()
+            .map(|result| result.get("text").cloned().unwrap_or(Value::Null))
+            .collect::<Vec<_>>();
+        if actual.as_slice()
+            != expected_results
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        {
             return Err(Error::InvalidResponse);
         }
     }

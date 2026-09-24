@@ -1,5 +1,6 @@
 //! Application assembly shared by Tauri and the local development host.
 use adapter_mcp::{AuthorizationCallback, ConnectionConfig, McpAuthentication, McpManager};
+use assistant_contracts::provider::AuthKind;
 use assistant_contracts::*;
 use assistant_core::{registry, Assistant};
 use provider_cloud::{valid_secret_reference, CloudConfig, CloudProvider};
@@ -37,6 +38,15 @@ pub struct Settings {
 struct SaveCloudProvider {
     cloud: CloudConfig,
     api_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveProviderProfile {
+    provider_id: String,
+    auth_option_id: String,
+    config: serde_json::Value,
+    secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +246,18 @@ impl Runtime {
     /// The value remains outside SQLite and model context.
     pub fn restore_cloud_key(&self, config: &CloudConfig, key: String) -> Result<()> {
         self.secrets.set(config, key)
+    }
+
+    /// Restores a platform-keystore catalog provider key into the session scope.
+    /// The value remains outside SQLite and model context.
+    pub fn restore_provider_key(
+        &self,
+        provider_id: &str,
+        auth_option_id: &str,
+        key: String,
+    ) -> Result<()> {
+        self.secrets
+            .set_provider_key(provider_id, auth_option_id, key)
     }
 
     fn next_step_suggestions(&self, tasks: &[Task]) -> Vec<serde_json::Value> {
@@ -505,6 +527,11 @@ impl Runtime {
         };
         match name {
             "snapshot" => self.snapshot().await,
+            "get_provider_catalog" => {
+                let catalog = assistant_contracts::catalog_seeds::default_catalog()
+                    .map_err(|_| Error::Storage)?;
+                Ok(serde_json::to_value(catalog).map_err(|_| Error::Storage)?)
+            }
             "next_step_suggestions" => {
                 let tasks = self.store.tasks()?;
                 Ok(serde_json::json!(self.next_step_suggestions(&tasks)))
@@ -606,6 +633,186 @@ impl Runtime {
             "clear_cloud_key" => {
                 self.secrets.clear()?;
                 Ok(serde_json::json!(null))
+            }
+            "save_provider_profile" => {
+                let request: SaveProviderProfile =
+                    serde_json::from_value(payload).map_err(|_| Error::InvalidInput)?;
+                let catalog = assistant_contracts::catalog_seeds::default_catalog()
+                    .map_err(|_| Error::Storage)?;
+                let definition = catalog
+                    .get(&request.provider_id)
+                    .ok_or(Error::InvalidInput)?;
+                if definition.availability
+                    != assistant_contracts::provider::ProviderAvailability::Available
+                {
+                    return Err(Error::Unavailable);
+                }
+                let option = definition
+                    .auth_options
+                    .iter()
+                    .find(|option| option.id == request.auth_option_id)
+                    .ok_or(Error::InvalidInput)?;
+                if !request.config.is_object() {
+                    return Err(Error::InvalidInput);
+                }
+                if let Some(base_url) = request
+                    .config
+                    .get("base_url")
+                    .and_then(|value| value.as_str())
+                {
+                    if !base_url.trim().is_empty() {
+                        assistant_contracts::provider::normalize_endpoint(Some(base_url), None)
+                            .map_err(|_| Error::InvalidInput)?;
+                    }
+                }
+                let needs_secret = option.auth_kind != AuthKind::None;
+                match (&request.secret, needs_secret) {
+                    (Some(_), false) => return Err(Error::InvalidInput),
+                    (None, true) => return Err(Error::InvalidInput),
+                    _ => {}
+                }
+                if let Some(secret) = &request.secret {
+                    SessionSecrets::validate(secret)?;
+                    if contains_secret(&request.config, secret) {
+                        return Err(Error::InvalidInput);
+                    }
+                }
+                let mut profile = ProviderProfile::new(
+                    request.provider_id.clone(),
+                    request.auth_option_id.clone(),
+                );
+                profile.non_secret_config = request.config;
+                profile.display_name = Some(definition.display_name.clone());
+                profile.validate().map_err(|_| Error::InvalidInput)?;
+                self.store.save_provider_profile(&profile)?;
+                if let Some(secret) = request.secret {
+                    self.secrets.set_provider_key(
+                        &request.provider_id,
+                        &request.auth_option_id,
+                        secret,
+                    )?;
+                }
+                self.refresh_cloud_provider().await?;
+                Ok(serde_json::to_value(profile).map_err(|_| Error::Storage)?)
+            }
+            "list_provider_profiles" => {
+                let profiles = self.store.provider_profiles()?;
+                let active = self
+                    .store
+                    .setting("active_provider_id")?
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let annotated = profiles
+                    .into_iter()
+                    .map(|profile| {
+                        let key_configured = self
+                            .secrets
+                            .has_provider_key(&profile.provider_id, &profile.auth_option_id);
+                        serde_json::json!({ "profile": profile, "key_configured": key_configured, "active": active.as_deref() == Some(profile.provider_id.as_str()) })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::Value::Array(annotated))
+            }
+            "delete_provider_profile" => {
+                let provider_id = payload["provider_id"].as_str().ok_or(Error::InvalidInput)?;
+                self.store.delete_provider_profile(provider_id)?;
+                self.secrets.clear_provider_key(provider_id)?;
+                if self
+                    .store
+                    .setting("active_provider_id")?
+                    .is_some_and(|value| value.as_str() == Some(provider_id))
+                {
+                    self.store
+                        .set_setting("active_provider_id", &serde_json::Value::Null)?;
+                }
+                self.refresh_cloud_provider().await?;
+                Ok(serde_json::json!(null))
+            }
+            "set_active_provider" => {
+                let provider_id = payload["provider_id"].as_str().ok_or(Error::InvalidInput)?;
+                self.store
+                    .provider_profile(provider_id)?
+                    .ok_or(Error::InvalidInput)?;
+                self.store.set_setting(
+                    "active_provider_id",
+                    &serde_json::Value::String(provider_id.to_owned()),
+                )?;
+                self.refresh_cloud_provider().await?;
+                Ok(serde_json::json!(null))
+            }
+            "test_provider_connection" => {
+                let provider_id = payload["provider_id"].as_str().ok_or(Error::InvalidInput)?;
+                let profile = self
+                    .store
+                    .provider_profile(provider_id)?
+                    .ok_or(Error::InvalidInput)?;
+                let catalog = assistant_contracts::catalog_seeds::default_catalog()
+                    .map_err(|_| Error::Storage)?;
+                let definition = catalog
+                    .get(&profile.provider_id)
+                    .ok_or(Error::InvalidInput)?;
+                let option = definition
+                    .auth_options
+                    .iter()
+                    .find(|option| option.id == profile.auth_option_id)
+                    .ok_or(Error::InvalidInput)?;
+                let secret = if option.auth_kind == AuthKind::None {
+                    None
+                } else {
+                    Some(
+                        self.secrets
+                            .provider_secret(&profile.provider_id, &profile.auth_option_id)?,
+                    )
+                };
+                let transport = provider_rig::transport::build_transport(
+                    definition,
+                    option,
+                    &profile.non_secret_config,
+                    secret.as_deref(),
+                )
+                .map_err(|_| Error::InvalidInput)?;
+                let model = match &transport {
+                    provider_rig::transport::ProviderTransport::OpenAi { model, .. }
+                    | provider_rig::transport::ProviderTransport::Anthropic { model, .. }
+                    | provider_rig::transport::ProviderTransport::Gemini { model, .. } => {
+                        model.clone()
+                    }
+                    provider_rig::transport::ProviderTransport::Azure { deployment, .. } => {
+                        deployment.clone()
+                    }
+                };
+                let probe = ModelRequest {
+                    schema: MODEL_REQUEST_SCHEMA_V1.into(),
+                    messages: vec![ModelMessage {
+                        role: ModelMessageRole::User,
+                        content: "hi".into(),
+                        tool_call_id: None,
+                    }],
+                    tools: vec![],
+                    model: model.to_owned(),
+                    max_tokens: Some(16),
+                    temperature: None,
+                    stream: false,
+                };
+                let started = std::time::Instant::now();
+                match provider_rig::transport::complete_transport(&transport, &probe).await {
+                    Ok(response) => Ok(serde_json::to_value(
+                        assistant_contracts::connection_test::ConnectionTestResult::success(
+                            &response.model_id,
+                            started.elapsed().as_millis() as u64,
+                        ),
+                    )
+                    .map_err(|_| Error::Storage)?),
+                    Err(provider_rig::RigAdapterError::Normalized(error)) => {
+                        let (kind, message) = test_failure(&error);
+                        Ok(serde_json::to_value(
+                            assistant_contracts::connection_test::ConnectionTestResult::failure(
+                                kind, &message,
+                            ),
+                        )
+                        .map_err(|_| Error::Storage)?)
+                    }
+                    Err(_) => Err(Error::Unavailable),
+                }
             }
             "save_mcp_credential" => {
                 let request: SaveMcpCredential =
@@ -827,6 +1034,23 @@ impl Runtime {
         }
     }
 
+    /// Rebuilds the assistant so new tasks use the currently configured
+    /// cloud provider. In-flight tasks keep running on the previous one.
+    pub async fn refresh_cloud_provider(&self) -> Result<()> {
+        let settings = self.settings.read().await.clone();
+        let assistant = assemble(
+            self.store.clone(),
+            self.mcp.clone(),
+            self.fast.clone(),
+            self.tool_executor.clone(),
+            &settings,
+            &self.secrets,
+            &self.oauth,
+        )?;
+        *self.assistant.write().await = assistant;
+        Ok(())
+    }
+
     async fn reject_known_secrets(&self, payload: &serde_json::Value) -> Result<()> {
         if self.secrets.payload_contains_secret(payload)
             || self.oauth.payload_contains_secret(payload)
@@ -867,6 +1091,49 @@ fn repair_credential_reference(settings: &mut Settings) -> bool {
 }
 fn launch(assistant: Arc<Assistant>, id: Id) {
     tokio::spawn(run_task(assistant, id));
+}
+
+fn test_failure(
+    error: &NormalizedError,
+) -> (
+    assistant_contracts::provider_health::NormalizedTestFailure,
+    String,
+) {
+    use assistant_contracts::provider_health::NormalizedTestFailure;
+    match error {
+        NormalizedError::AuthenticationFailed => (
+            NormalizedTestFailure::Credential,
+            "Authentication was rejected. Check the API key.".into(),
+        ),
+        NormalizedError::AuthorizationDenied => (
+            NormalizedTestFailure::Credential,
+            "Access was denied. Check the key permissions.".into(),
+        ),
+        NormalizedError::EndpointNotFound => (
+            NormalizedTestFailure::Endpoint,
+            "The endpoint could not be reached. Check the base URL.".into(),
+        ),
+        NormalizedError::ModelNotFound => (
+            NormalizedTestFailure::ModelNotFound,
+            "The model was not found. Check the model ID.".into(),
+        ),
+        NormalizedError::RateLimited { .. } | NormalizedError::QuotaExceeded => (
+            NormalizedTestFailure::Quota,
+            "Quota or rate limit reached. Retry later.".into(),
+        ),
+        NormalizedError::Timeout | NormalizedError::NetworkUnavailable => (
+            NormalizedTestFailure::Network,
+            "The network request failed. Check connectivity.".into(),
+        ),
+        NormalizedError::InvalidResponse { detail } => (
+            NormalizedTestFailure::ProviderError,
+            format!("The provider returned an invalid response: {detail}"),
+        ),
+        NormalizedError::ProviderError { detail, .. } => (
+            NormalizedTestFailure::ProviderError,
+            format!("The provider returned an error: {detail}"),
+        ),
+    }
 }
 
 fn bounded_rule_text(payload: &serde_json::Value, key: &str, limit: usize) -> Result<String> {
@@ -963,12 +1230,15 @@ fn assemble(
     {
         return Err(Error::InvalidInput);
     }
-    let cloud: Arc<dyn ModelProvider> = match &settings.cloud {
-        Some(config) => Arc::new(CloudProvider::new(
-            config.clone(),
-            secrets.provider(config),
-        )?),
-        None => Arc::new(NeedleProvider::unavailable()),
+    let cloud: Arc<dyn ModelProvider> = match rig_cloud_provider(&store, secrets) {
+        Some(provider) => provider,
+        None => match &settings.cloud {
+            Some(config) => Arc::new(CloudProvider::new(
+                config.clone(),
+                secrets.provider(config),
+            )?),
+            None => Arc::new(NeedleProvider::unavailable()),
+        },
     };
     let secret_store = secrets.clone();
     let oauth_store = oauth.clone();
@@ -1004,6 +1274,54 @@ fn assemble(
 struct RoutingExecutor {
     native: Arc<dyn ToolExecutor>,
     mcp: Arc<McpManager>,
+}
+
+fn rig_cloud_provider(
+    store: &SqliteStore,
+    secrets: &SessionSecrets,
+) -> Option<Arc<dyn ModelProvider>> {
+    let profiles = store.provider_profiles().ok()?;
+    let active = store
+        .setting("active_provider_id")
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let catalog = assistant_contracts::catalog_seeds::default_catalog().ok()?;
+    let mut ordered: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
+    ordered.sort_by_key(|profile| active.as_deref() != Some(profile.provider_id.as_str()));
+    for profile in ordered {
+        let definition = catalog.get(&profile.provider_id)?;
+        if definition.availability != assistant_contracts::provider::ProviderAvailability::Available
+        {
+            continue;
+        }
+        let option = definition
+            .auth_options
+            .iter()
+            .find(|option| option.id == profile.auth_option_id)?;
+        let secret = if option.auth_kind == AuthKind::None {
+            None
+        } else {
+            Some(
+                secrets
+                    .provider_secret(&profile.provider_id, &profile.auth_option_id)
+                    .ok()?,
+            )
+        };
+        let transport = provider_rig::transport::build_transport(
+            definition,
+            option,
+            &profile.non_secret_config,
+            secret.as_deref(),
+        )
+        .ok()?;
+        if let Ok(provider) =
+            provider_rig::cloud::RigCloudProvider::new(&profile.provider_id, transport)
+        {
+            return Some(Arc::new(provider));
+        }
+    }
+    None
 }
 
 #[async_trait::async_trait]

@@ -1,6 +1,14 @@
 use super::*;
 
 #[tokio::test]
+async fn injected_fast_provider_reports_ready() {
+    let fast: Arc<dyn ModelProvider> =
+        Arc::new(assistant_core::testing::ScriptedProvider::new(true, vec![]));
+    let runtime = Runtime::open_with_fast_provider(":memory:", fast).unwrap();
+    assert_eq!(runtime.snapshot().await.unwrap()["needle"], "ready");
+}
+
+#[tokio::test]
 async fn run_event_pages_preserve_the_reconnect_cursor() {
     let empty_runtime = Runtime::open(":memory:").unwrap();
     let empty_reset = empty_runtime
@@ -294,7 +302,8 @@ async fn mcp_credentials_are_session_only_and_bound_before_network_io() {
         )
         .await
         .unwrap();
-    assert_eq!(status["credential"], "configured");
+    assert_eq!(status["state"], "connected");
+    assert_eq!(status["schema"], CONNECTION_STATE_SCHEMA_V1);
     for output in [
         runtime.snapshot().await.unwrap(),
         runtime.store.setting("settings").unwrap().unwrap(),
@@ -331,8 +340,8 @@ async fn mcp_credentials_are_session_only_and_bound_before_network_io() {
                 serde_json::json!({"connection_id":"protected-fixture"}),
             )
             .await
-            .unwrap()["credential"],
-        "missing"
+            .unwrap()["state"],
+        "required"
     );
     drop(runtime);
 
@@ -344,8 +353,8 @@ async fn mcp_credentials_are_session_only_and_bound_before_network_io() {
                 serde_json::json!({"connection_id":"protected-fixture"}),
             )
             .await
-            .unwrap()["credential"],
-        "missing"
+            .unwrap()["state"],
+        "required"
     );
     drop(reopened);
     std::fs::remove_file(path).unwrap();
@@ -379,7 +388,8 @@ async fn oauth_manifest_is_persisted_but_access_tokens_require_the_oauth_flow() 
         )
         .await
         .unwrap();
-    assert_eq!(status["state"], "missing");
+    assert_eq!(status["state"], "required");
+    assert_eq!(status["requested_scopes"], serde_json::json!(["read"]));
     assert_eq!(
         runtime
             .dispatch(
@@ -398,4 +408,109 @@ async fn oauth_manifest_is_persisted_but_access_tokens_require_the_oauth_flow() 
             .await,
         Err(Error::AuthRequired)
     );
+}
+
+#[tokio::test]
+async fn opening_runtime_finalizes_expired_interrupted_graphs() {
+    let path = std::env::temp_dir().join(format!("assistant-recovery-test-{}.db", Id::new_v4()));
+    let store = SqliteStore::open(&path).unwrap();
+    let mut task = Task::new(UserInput {
+        conversation_id: Id::new_v4(),
+        text: "recover after restart".into(),
+        source: InputSource::Text,
+    });
+    task.status = TaskStatus::Running;
+    let node_id = Id::new_v4();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    task.work_graph = Some(WorkGraph {
+        schema: WORK_GRAPH_SCHEMA_V1.into(),
+        task_id: task.id,
+        created_at: at.saturating_sub(2),
+        deadline_at: at.saturating_sub(1),
+        max_parallel_workers: 1,
+        nodes: vec![WorkNode {
+            id: node_id,
+            task_id: task.id,
+            idempotency_key: format!("{}:0:expired", task.id),
+            deadline_at: at.saturating_sub(1),
+            retry_budget: 1,
+            attempts: 1,
+            state: WorkNodeState::Running,
+            dependency_policy: DependencyPolicy::AllSucceeded,
+            request: WorkerRequest {
+                worker_id: Id::new_v4(),
+                node_id,
+                task_id: task.id,
+                objective: "expired work".into(),
+                operation: WorkerOperation::Infer,
+                context: ContextBundle {
+                    task_id: task.id,
+                    role: Role::Reasoner,
+                    goal: "expired work".into(),
+                    plan: vec![],
+                    handoff: None,
+                    history: vec![],
+                    results: vec![],
+                    skills: vec![],
+                    candidates: vec![],
+                    tools: vec![],
+                    adaptive_rules: vec![],
+                },
+            },
+            result_refs: vec![],
+        }],
+        edges: vec![],
+    });
+    store.save_task(&task).unwrap();
+    drop(store);
+
+    let runtime = Runtime::open(&path).unwrap();
+    let recovered = runtime.store.task(task.id).unwrap();
+    assert_eq!(recovered.status, TaskStatus::Failed);
+    assert_eq!(
+        recovered.work_graph.unwrap().nodes[0].state,
+        WorkNodeState::Failed
+    );
+    drop(runtime);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn startup_recovery_runs_without_an_entered_tokio_handle() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let provider = Arc::new(assistant_core::testing::ScriptedProvider::new(
+        false,
+        vec![AgentAction::Respond {
+            text: "recovered".into(),
+        }],
+    ));
+    let assistant = Arc::new(Assistant::new(
+        store.clone(),
+        provider.clone(),
+        provider,
+        Arc::new(assistant_core::testing::EchoExecutor),
+        EngineConfig::default(),
+    ));
+    let task = assistant
+        .submit(UserInput {
+            conversation_id: Id::new_v4(),
+            text: "resume".into(),
+            source: InputSource::Text,
+        })
+        .unwrap();
+
+    launch_recovery(assistant, vec![task.id]).unwrap();
+
+    for _ in 0..100 {
+        let current = store.task(task.id).unwrap();
+        if current.status.terminal() {
+            assert_eq!(current.status, TaskStatus::Completed);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("startup recovery did not finish");
 }

@@ -72,11 +72,53 @@ impl SqliteStore {
 
     /// Deletes a conversation and its messages and research sessions.
     pub fn delete_conversation(&self, id: Id) -> Result<bool> {
-        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
-        Ok(conn
+        let mut conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        let tx = conn.transaction().map_err(|_| Error::Storage)?;
+        // Forget derived personalization together with its source conversation.
+        let rule_ids = {
+            let mut stmt=tx.prepare("SELECT id FROM adaptive_rules WHERE json_extract(data,'$.scope.conversation')=?1 OR EXISTS(SELECT 1 FROM json_each(adaptive_rules.data,'$.evidence_ids') e JOIN personal_observations o ON o.id=e.value WHERE o.conversation_id=?1)").map_err(|_| Error::Storage)?;
+            let rows = stmt
+                .query_map([id.to_string()], |r| r.get::<_, String>(0))
+                .map_err(|_| Error::Storage)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| Error::Storage)?
+        };
+        for rule_id in rule_ids {
+            for table in [
+                "personal_revisions",
+                "generated_skills",
+                "skill_evaluations",
+                "personal_usage",
+                "personal_replacements",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE rule_id=?1"), [&rule_id])
+                    .map_err(|_| Error::Storage)?;
+            }
+            tx.execute(
+                "DELETE FROM rule_proposals WHERE json_extract(data,'$.rule.id')=?1",
+                [&rule_id],
+            )
+            .map_err(|_| Error::Storage)?;
+            tx.execute("DELETE FROM adaptive_rules WHERE id=?1", [rule_id])
+                .map_err(|_| Error::Storage)?;
+        }
+        tx.execute("DELETE FROM learning_candidates WHERE observation_id IN (SELECT id FROM personal_observations WHERE conversation_id=?1)",[id.to_string()]).map_err(|_| Error::Storage)?;
+        tx.execute(
+            "DELETE FROM personal_observations WHERE conversation_id=?1",
+            [id.to_string()],
+        )
+        .map_err(|_| Error::Storage)?;
+        tx.execute(
+            "DELETE FROM personal_usage WHERE conversation_id=?1",
+            [id.to_string()],
+        )
+        .map_err(|_| Error::Storage)?;
+        let deleted = tx
             .execute("DELETE FROM conversations WHERE id=?1", [id.to_string()])
             .map_err(|_| Error::Storage)?
-            != 0)
+            != 0;
+        tx.commit().map_err(|_| Error::Storage)?;
+        Ok(deleted)
     }
 
     /// Appends a message if its conversation exists.

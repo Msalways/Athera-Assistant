@@ -14,6 +14,7 @@ fn context() -> ContextBundle {
         skills: vec![],
         candidates: vec![],
         tools: vec![],
+        adaptive_rules: vec![],
     }
 }
 fn config(api: ApiKind) -> CloudConfig {

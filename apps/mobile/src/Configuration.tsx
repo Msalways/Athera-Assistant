@@ -13,17 +13,27 @@ import type {
   BuildInfo,
   Capability,
   ConnectionState,
-  CloudConnectionTest,
   OAuthAuthorizationStart,
   OAuthAuthorizationPoll,
-  Settings,
+  ProviderProfileDraft,
+  SavedProviderProfile,
   Snapshot,
   Skill,
   Risk,
 } from "./types";
 import type { ModelStatus, PersonalMemory } from "./types";
-import { command, getBuildInfo } from "./service";
+import {
+  command,
+  deleteProviderProfile,
+  getBuildInfo,
+  listProviderProfiles,
+  saveProviderProfile,
+  setActiveProvider,
+  testProviderConnection,
+} from "./service";
+import type { ConnectionTestOutcome } from "./service";
 import { AdaptiveRulesSettings } from "./AdaptiveRules";
+import { ProviderCatalogSettings } from "./ProviderCatalogSettings";
 
 type Act = (name: string, payload: unknown) => Promise<boolean>;
 export function Configuration({
@@ -497,13 +507,7 @@ export function Configuration({
         ))}
       </div>
       {tab === "models" ? (
-        <ModelSettings
-          key={JSON.stringify(snapshot.settings.cloud)}
-          settings={snapshot.settings}
-          needle={snapshot.needle}
-          sessionKey={snapshot.cloud_session_key}
-          act={act}
-        />
+        <ModelSettings needle={snapshot.needle} />
       ) : tab === "memory" ? (
         <MemorySettings />
       ) : tab === "rules" ? (
@@ -641,50 +645,7 @@ function CapabilityRow({ entry, act }: { entry: Capability; act: Act }) {
     </div>
   );
 }
-function ModelSettings({
-  settings,
-  act,
-  needle,
-  sessionKey,
-}: {
-  settings: Settings;
-  act: Act;
-  needle: string;
-  sessionKey: boolean;
-}) {
-  const [cloud, setCloud] = useState(
-    settings.cloud ?? {
-      id: "cloud",
-      endpoint: "https://api.openai.com/v1",
-      model: "",
-      secret_ref: "ASSISTANT_CLOUD_KEY",
-      api: "responses" as const,
-    },
-  );
-  const [busy, setBusy] = useState(false);
-  const [apiKey, setApiKey] = useState("");
-  const [test, setTest] = useState<CloudConnectionTest | null>(null);
-
-  async function testConnection() {
-    setBusy(true);
-    setTest(null);
-    try {
-      setTest(
-        await command<CloudConnectionTest>("test_cloud_provider", {
-          cloud,
-          api_key: apiKey || null,
-        }),
-      );
-    } catch {
-      setTest({
-        state: "unavailable",
-        message:
-          "The configuration test could not start. Check the settings and try again.",
-      });
-    } finally {
-      setBusy(false);
-    }
-  }
+function ModelSettings({ needle }: { needle: string }) {
   return (
     <>
       <LocalModelSettings />
@@ -697,131 +658,157 @@ function ModelSettings({
           {needle === "ready" ? "Ready" : "Not linked"}
         </span>
       </div>
-      <form
-        className="settings-form"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          setBusy(true);
-          try {
-            if (
-              await act("save_cloud_provider", {
-                cloud,
-                api_key: apiKey || null,
-              })
-            ) {
-              setApiKey("");
-            }
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <h3>Action model</h3>
-        <p className="field-help">
-          Used only in Action mode for planning and tool use.
+      <ProviderProfilesSection />
+    </>
+  );
+}
+
+function ProviderProfilesSection() {
+  const [profiles, setProfiles] = useState<SavedProviderProfile[]>([]);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const refresh = async () => {
+    try {
+      setProfiles(await listProviderProfiles());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load providers");
+    }
+  };
+  useEffect(() => {
+    void refresh();
+  }, []);
+  const save = async (draft: ProviderProfileDraft) => {
+    setBusy(true);
+    setStatus("");
+    setError("");
+    try {
+      await saveProviderProfile(draft);
+      setStatus("Provider saved.");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save provider");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (provider_id: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      await deleteProviderProfile(provider_id);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not remove provider");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const activate = async (provider_id: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      await setActiveProvider(provider_id);
+      setStatus("Active provider updated.");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not set active provider");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<
+    Record<string, ConnectionTestOutcome>
+  >({});
+  const test = async (provider_id: string) => {
+    setTestingId(provider_id);
+    setError("");
+    try {
+      const outcome = await testProviderConnection(provider_id);
+      setTestResults((prev) => ({ ...prev, [provider_id]: outcome }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not test connection");
+    } finally {
+      setTestingId(null);
+    }
+  };
+  return (
+    <>
+      <h3>Cloud providers</h3>
+      <p className="field-help">
+        Providers and auth fields come from the Rust catalog. Secrets stay on
+        this device and are never shown again.
+      </p>
+      <ProviderCatalogSettings onSave={(draft) => void save(draft)} />
+      {busy && <p className="field-help">Working…</p>}
+      {status && (
+        <p role="status" className="field-help">
+          {status}
         </p>
-        <label>
-          API
-          <select
-            value={cloud.api}
-            onChange={(e) =>
-              setCloud({
-                ...cloud,
-                api: e.target.value as "responses" | "chat_completions",
-              })
-            }
-          >
-            <option value="responses">OpenAI Responses</option>
-            <option value="chat_completions">OpenAI-compatible</option>
-          </select>
-        </label>
-        <label>
-          Endpoint
-          <input
-            type="url"
-            required
-            value={cloud.endpoint}
-            onChange={(e) => setCloud({ ...cloud, endpoint: e.target.value })}
-          />
-        </label>
-        <label>
-          Model
-          <input
-            required
-            placeholder="Model ID"
-            value={cloud.model}
-            onChange={(e) => setCloud({ ...cloud, model: e.target.value })}
-          />
-        </label>
-        <label>
-          API key (stored securely on this device)
-          <input
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            maxLength={8192}
-            placeholder={sessionKey ? "Secure key stored" : "Enter API key"}
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-          />
-        </label>
-        {sessionKey && (
-          <button
-            className="secondary"
-            type="button"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                if (await act("clear_cloud_key", {})) setApiKey("");
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            <Trash2 size={17} /> Remove stored key
-          </button>
-        )}
-        <details>
-          <summary>Advanced credentials</summary>
-          <label>
-            Credential environment variable
-            <input
-              required
-              pattern="ASSISTANT_[A-Z0-9_]*_KEY"
-              maxLength={128}
-              placeholder="ASSISTANT_CLOUD_KEY"
-              title="Backend environment variable name, not an API key"
-              value={cloud.secret_ref}
-              onChange={(e) =>
-                setCloud({ ...cloud, secret_ref: e.target.value })
-              }
-            />
-          </label>
-        </details>
-        <button
-          className="secondary"
-          type="button"
-          disabled={busy}
-          onClick={() => void testConnection()}
-        >
-          {busy ? "Testing..." : "Test connection"}
-        </button>
-        {test && (
-          <p
-            role="status"
-            className={
-              test.state === "connected" ? "field-help" : "inline-error"
-            }
-          >
-            {test.message}
-          </p>
-        )}
-        <button className="primary" disabled={busy}>
-          <Check size={17} />
-          {busy ? "Saving..." : "Save provider"}
-        </button>
-      </form>
+      )}
+      {error && (
+        <p role="alert" className="inline-error">
+          {error}
+        </p>
+      )}
+      <ul className="provider-list">
+        {profiles.map(({ profile, key_configured, active }) => (
+          <li key={profile.provider_id}>
+            <div>
+              <strong>
+                {profile.display_name ?? profile.provider_id}
+              </strong>{" "}
+              <small>{profile.auth_option_id}</small>
+            </div>
+            <span className="badge amber">
+              {key_configured ? "Key stored" : "No key"}
+            </span>
+            {active && <span className="badge green">Active</span>}
+            {!active && (
+              <button
+                className="secondary"
+                type="button"
+                disabled={busy}
+                onClick={() => void activate(profile.provider_id)}
+                aria-label={`Use ${profile.display_name ?? profile.provider_id} for inference`}
+              >
+                Use for inference
+              </button>
+            )}
+            <button
+              className="secondary"
+              type="button"
+              disabled={busy || testingId === profile.provider_id}
+              onClick={() => void test(profile.provider_id)}
+              aria-label={`Test ${profile.display_name ?? profile.provider_id} connection`}
+            >
+              {testingId === profile.provider_id ? "Testing…" : "Test connection"}
+            </button>
+            {testResults[profile.provider_id] && (
+              <p
+                role="status"
+                className={
+                  testResults[profile.provider_id]?.success
+                    ? "field-help"
+                    : "inline-error"
+                }
+              >
+                {testResults[profile.provider_id]?.message}
+              </p>
+            )}
+            <button
+              className="secondary"
+              type="button"
+              disabled={busy}
+              onClick={() => void remove(profile.provider_id)}
+              aria-label={`Remove ${profile.display_name ?? profile.provider_id}`}
+            >
+              <Trash2 size={17} /> Remove
+            </button>
+          </li>
+        ))}
+      </ul>
     </>
   );
 }

@@ -67,7 +67,7 @@ export default function SmsExperiment() {
     <div className="app-shell sms-experiment">
       <header className="topbar">
         <div>
-          <h1>Needle SMS experiment</h1>
+          <h1>Athera SMS</h1>
           <p>On-device inference · No cloud fallback</p>
         </div>
       </header>

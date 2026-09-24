@@ -685,6 +685,16 @@ summary svg {
   background: #fbf0d9;
   color: #8a671f;
 }
+.green {
+  background: #dff0d8;
+  color: #2f6b2f;
+}
+@media (prefers-color-scheme: dark) {
+  .green {
+    background: #1e3a1e;
+    color: #9fd09f;
+  }
+}
 .empty-state {
   padding: 32px 0;
   color: var(--muted);

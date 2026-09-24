@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { command } from "./service";
 import { ResearchPanel } from "./ResearchPanel";
+import { PreferenceFeedback } from "./PreferenceFeedback";
 import type { Conversation, Message, ModelStatus } from "./types";
 
 type Props = {
@@ -266,6 +267,11 @@ export function ConversationView({
                     {message.content ||
                       (message.status === "generating" ? "Thinking…" : "")}
                   </div>
+                  {!temporary &&
+                    message.role === "assistant" &&
+                    message.status === "complete" && (
+                      <PreferenceFeedback message={message} />
+                    )}
                   {message.role === "assistant" &&
                     message.status !== "complete" && (
                       <small>{statusLabel(message.status)}</small>
@@ -362,10 +368,10 @@ function EmptyConversation({
         ? "Verifying the downloaded local model."
         : installation?.status === "failed"
           ? `The model download failed${installation.error ? `: ${installation.error}` : ". Retry from Settings."}`
-          : installation?.status === "cancelled"
+            : installation?.status === "cancelled"
             ? "The model download was cancelled. Set it up when you are ready."
             : availability === "missing_model"
-              ? "Download the local model to start chatting."
+              ? "Needle is ready for lightweight on-device routing. Configure a cloud model in Settings for conversational answers; the offline model is optional."
               : availability === "unavailable"
                 ? "Local conversation is unavailable on this device."
                 : availability === "busy"
@@ -378,13 +384,12 @@ function EmptyConversation({
       <MessageSquare size={34} />
       <h2>How can I help?</h2>
       <p>{copy}</p>
-      {(availability === "missing_model" ||
-        installation?.status === "failed" ||
+      {(installation?.status === "failed" ||
         installation?.status === "cancelled") && (
         <button className="primary" onClick={onOpenSettings}>
           {installation?.status === "failed"
-            ? "Retry local model setup"
-            : "Set up local model"}
+            ? "Retry offline chat setup"
+            : "Optional: download offline chat model"}
         </button>
       )}
     </div>

@@ -18,9 +18,9 @@ static Bearer, and reviewed API-key-header profiles. It resolves credentials thr
 an endpoint-bound interface before opening the transport, disables redirects, maps
 MCP 401 challenges to an authentication pause, and keeps credential values out of
 the manifest. OAuth manifests can be validated and bound to an existing opaque token
-reference, but browser authorization, refresh, Android Keystore storage, stdio,
-legacy SSE fallback, resources, prompts and elicitation remain unavailable until
-their verification gates pass.
+reference; browser authorization, refresh and Android Keystore storage are
+implemented behind their native boundary. Stdio, legacy SSE fallback, resources,
+prompts and elicitation remain unavailable until their verification gates pass.
 
 ## Runtime placement
 
@@ -147,8 +147,8 @@ The `connect_mcp_with_credential` command accepts a user-entered value, keeps it
 process memory, and saves only the manifest. `save_mcp_credential`,
 `clear_mcp_credential`, and `mcp_connection_status` provide repair and redacted status
 operations. A process restart removes these host-development credentials. Android
-must replace this resolver with Keystore-backed handles before the OAuth gate can
-pass.
+uses Keystore-backed handles for OAuth token records; the callback domain and live
+device proof remain required for the OAuth gate.
 
 The host OAuth contract parses Bearer challenges, builds the RFC 9728 protected
 resource discovery order and the required RFC 8414/OpenID discovery order, validates
@@ -171,9 +171,21 @@ are recreated before calls because the upstream HTTP transport owns a fixed head
 The setup UI supports pre-registration, Client ID Metadata Documents and advertised
 dynamic registration, with a manual callback field for host testing.
 
-Android Custom Tab launch, verified App Link callback delivery, Keystore-backed token
-commit, step-up challenge propagation, and a live consent/token/authenticated-call
-proof remain gated work. Host tokens intentionally disappear on process restart.
+The Android backend now launches the authorization URL in a Custom Tab and accepts
+only an exact HTTPS App Link callback (scheme, host, port and path). React receives
+neither the authorization URL nor the callback URL on Android. A native AES-GCM
+Keystore boundary binds encrypted values to connection metadata as associated data.
+The manifest currently uses a placeholder callback host; production domain and
+`assetlinks.json` verification are required. OAuthRuntime commits and restores the
+bound token record through the Keystore handle, while host tokens intentionally
+remain session-only.
+
+Validated `WWW-Authenticate` challenges are retained by connection and surface only
+authorization-server and scope metadata through `aethra.connection-state.v1`.
+`insufficient_scope` produces a step-up-required state and never exposes a token.
+The original task remains subject to its retry budget, and a write that paused after
+dispatch is not replayed automatically. Live consent/token/authenticated-call proof
+and upstream 403 coverage remain gated work.
 
 ## Upstream service authorization
 

@@ -1,5 +1,5 @@
 {
-  "productName": "Needle SMS Experiment",
-  "build": { "beforeBuildCommand": "npm run build:sms", "beforeDevCommand": "npm run dev -- --mode sms" },
+  "productName": "Athera",
+  "build": { "beforeBuildCommand": "npm run build", "beforeDevCommand": "npm run dev" },
   "bundle": { "android": { "minSdkVersion": 31 } }
 }

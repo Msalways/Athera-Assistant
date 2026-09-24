@@ -7,6 +7,7 @@ import type {
   Task,
 } from "./types";
 import { label } from "./App";
+import { PreferenceFeedback } from "./PreferenceFeedback";
 export function TaskView({
   task,
   events = [],
@@ -32,10 +33,11 @@ export function TaskView({
     .filter((event) => event.kind === "text_delta")
     .map((event) => event.text_delta ?? "")
     .join("");
+  const workers = workerActivity(events);
   return (
     <article className="task">
       <div className="user-message">{task.input.text}</div>
-      <div className="task-state">
+      <div className="task-state" aria-live="polite">
         <span className={task.status === "completed" ? "success" : ""}>
           {task.status === "completed" ? (
             <Check size={15} />
@@ -67,9 +69,34 @@ export function TaskView({
       ) : (
         task.message && <p className="assistant-message">{task.message}</p>
       )}
+      {task.status === "completed" && (
+        <PreferenceFeedback
+          message={{
+            id: task.id,
+            conversation_id: task.input.conversation_id,
+            role: "assistant",
+            content: task.message,
+            status: "complete",
+            created_at: 0,
+          }}
+        />
+      )}
       {events.length > 0 && (
         <details className="execution-events">
-          <summary>Execution · {events.length} events</summary>
+          <summary>
+            Execution · {events.length} events
+            {workers.length > 0 ? ` · ${workers.length} workers` : ""}
+          </summary>
+          {workers.length > 0 && (
+            <ul className="worker-activity" aria-label="Worker activity">
+              {workers.map((worker, index) => (
+                <li key={worker.id}>
+                  <span>Worker {index + 1}</span>
+                  <small>{worker.status}</small>
+                </li>
+              ))}
+            </ul>
+          )}
           <ol>
             {events.map((event) => (
               <li key={event.event_id}>
@@ -161,13 +188,19 @@ export function TaskView({
         </button>
       )}
       {task.status === "waiting_for_auth" && (
-        <button
-          className="secondary"
-          disabled={busy}
-          onClick={() => void perform("resume_auth", { task_id: task.id })}
-        >
-          <RefreshCw size={16} /> Resume
-        </button>
+        <section className="auth-required" aria-label="Connection required">
+          <p>
+            Connect the requested service, then retry this same task. No action
+            will be replayed while authorization is incomplete.
+          </p>
+          <button
+            className="secondary"
+            disabled={busy}
+            onClick={() => void perform("resume_auth", { task_id: task.id })}
+          >
+            <RefreshCw size={16} /> Retry after connecting
+          </button>
+        </section>
       )}
     </article>
   );
@@ -256,15 +289,42 @@ function OutputView({ output }: { output: AssistantOutput }) {
   );
 }
 
-function eventLabel(kind: RunEventKind) {
-  return {
-    run_started: "Started",
-    task_state: "Progress",
-    worker_started: "Worker started",
-    text_delta: "Text received",
-    worker_terminal: "Worker finished",
-    output_upsert: "Result updated",
-    run_paused: "Paused",
-    run_terminal: "Finished",
-  }[kind];
+function eventLabel(kind: RunEventKind | string) {
+  return (
+    {
+      run_started: "Started",
+      task_state: "Progress",
+      worker_started: "Worker started",
+      text_delta: "Text received",
+      worker_terminal: "Worker finished",
+      output_upsert: "Result updated",
+      run_paused: "Paused",
+      run_terminal: "Finished",
+    }[kind] ?? kind.replaceAll("_", " ")
+  );
+}
+
+function workerActivity(events: RunEventEnvelope[]) {
+  const workers = new Map<string, { id: string; status: string }>();
+  for (const event of [...events].sort(
+    (left, right) => left.sequence - right.sequence,
+  )) {
+    if (!event.worker_id) continue;
+    workers.set(event.worker_id, {
+      id: event.worker_id,
+      status:
+        event.kind === "worker_terminal"
+          ? event.message.toLowerCase().includes("failed")
+            ? "Failed"
+            : event.message.toLowerCase().includes("cancel")
+              ? "Cancelled"
+              : "Completed"
+          : event.kind === "worker_started"
+            ? "Running"
+            : event.kind === "text_delta"
+              ? "Running"
+              : (workers.get(event.worker_id)?.status ?? "Queued"),
+    });
+  }
+  return [...workers.values()];
 }

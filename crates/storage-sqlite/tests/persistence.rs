@@ -7,6 +7,42 @@ use rusqlite::Connection;
 use serde_json::json;
 use storage_sqlite::SqliteStore;
 #[test]
+fn migrates_legacy_preferences_once_and_marks_missing_history() {
+    let path =
+        std::env::temp_dir().join(format!("assistant-personal-migration-{}.db", Id::new_v4()));
+    let id = Id::new_v4();
+    let proposal_id = Id::new_v4();
+    let rule = json!({"schema":ADAPTIVE_RULE_SCHEMA_V1,"id":id,"version":3,"scope":"global","status":"disabled","source":"user","priority":50,"instruction":"Be concise","evidence_ids":[],"created_at":1700000000_u64,"updated_at":1700000010_u64,"expires_at":null,"supersedes":null});
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../../../migrations/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../migrations/005_adaptive_rules.sql"))
+            .unwrap();
+        conn.execute("INSERT INTO adaptive_rules(id,status,scope,updated_at,data) VALUES(?1,'\"disabled\"','\"global\"',1700000010,?2)",rusqlite::params![id.to_string(),rule.to_string()]).unwrap();
+        let mut stale = rule.clone();
+        stale["status"] = json!("enabled");
+        let proposal = json!({"schema":RULE_PROPOSAL_SCHEMA_V1,"id":proposal_id,"rule":stale,"rationale":"Legacy preference","proposed_at":1700000000_u64});
+        conn.execute(
+            "INSERT INTO rule_proposals VALUES(?1,'\"enabled\"',1700000000,?2)",
+            rusqlite::params![proposal_id.to_string(), proposal.to_string()],
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.adaptive_rule(id).unwrap().created_at, 1700000000000);
+        let revisions = store.rule_history(id).unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert!(revisions[0].historical_baseline);
+        assert_eq!(
+            store.rule_proposal(proposal_id).unwrap().rule.status,
+            AdaptiveRuleStatus::Disabled
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+#[test]
 fn reopens_tasks_results_and_settings_with_ordered_events() {
     let path = std::env::temp_dir().join(format!("assistant-test-{}.db", Id::new_v4()));
     let task = Task::new(UserInput {
@@ -34,6 +70,43 @@ fn reopens_tasks_results_and_settings_with_ordered_events() {
         assert!(store.events(1).unwrap().is_empty());
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn unfinished_task_enumeration_is_not_limited_to_the_recent_snapshot() {
+    let store = SqliteStore::memory().unwrap();
+    let unfinished = Task::new(UserInput {
+        conversation_id: Id::new_v4(),
+        text: "recover me".into(),
+        source: InputSource::Text,
+    });
+    store.save_task(&unfinished).unwrap();
+    for index in 0..201 {
+        let mut completed = Task::new(UserInput {
+            conversation_id: Id::new_v4(),
+            text: format!("completed {index}"),
+            source: InputSource::Text,
+        });
+        completed.status = TaskStatus::Completed;
+        completed.message = "done".into();
+        completed.output = Some(AssistantOutput::markdown("done"));
+        store.save_task(&completed).unwrap();
+    }
+
+    assert!(!store
+        .tasks()
+        .unwrap()
+        .iter()
+        .any(|task| task.id == unfinished.id));
+    assert_eq!(
+        store
+            .unfinished_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>(),
+        vec![unfinished.id]
+    );
 }
 
 #[test]
@@ -288,4 +361,78 @@ fn research_sessions_keep_immutable_ordered_note_revisions() {
         1
     );
     assert!(store.delete_research_session(session_id).unwrap());
+}
+
+#[test]
+fn adaptive_rules_are_versioned_bounded_and_user_transitioned() {
+    let store = SqliteStore::memory().unwrap();
+    let id = Id::new_v4();
+    let mut rule = AdaptiveRule {
+        schema: ADAPTIVE_RULE_SCHEMA_V1.into(),
+        id,
+        version: 1,
+        scope: RuleScope::Global,
+        status: AdaptiveRuleStatus::Proposed,
+        source: RuleSource::Model,
+        priority: 20,
+        instruction: "Prefer concise answers".into(),
+        evidence_ids: vec![Id::new_v4()],
+        created_at: 1,
+        updated_at: 1,
+        expires_at: None,
+        supersedes: None,
+        preference_key: None,
+    };
+    let proposal = RuleProposal {
+        schema: RULE_PROPOSAL_SCHEMA_V1.into(),
+        id: Id::new_v4(),
+        rule: rule.clone(),
+        rationale: "Repeated user corrections".into(),
+        proposed_at: 2,
+    };
+    store.put_rule_proposal(&proposal).unwrap();
+    assert_eq!(
+        store
+            .rule_proposals(Some(AdaptiveRuleStatus::Proposed), 5)
+            .unwrap()
+            .len(),
+        1
+    );
+    store.put_adaptive_rule(&rule).unwrap();
+    store
+        .set_adaptive_rule_status(id, AdaptiveRuleStatus::Enabled, 3)
+        .unwrap();
+    rule.status = AdaptiveRuleStatus::Enabled;
+    rule.version = 2;
+    rule.updated_at = 3;
+    assert_eq!(store.adaptive_rule(id).unwrap(), rule);
+    assert_eq!(
+        store
+            .adaptive_rules(Some(&RuleScope::Global), 5)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn jobs_persist_cancel_and_report_due() {
+    let store = SqliteStore::memory().unwrap();
+    let mut job = DurableJob::schedule("job-1", "remind me", 2000, 1000).unwrap();
+    store.save_job(&job).unwrap();
+    assert_eq!(store.job("job-1").unwrap().unwrap(), job);
+    assert!(store.due_jobs(1500).unwrap().is_empty());
+    assert_eq!(store.due_jobs(2000).unwrap().len(), 1);
+    job.cancel(1500).unwrap();
+    store.save_job(&job).unwrap();
+    assert!(store.due_jobs(9999).unwrap().is_empty());
+    assert_eq!(store.job("missing").unwrap(), None);
+}
+
+#[test]
+fn job_save_rejects_invalid_records() {
+    let store = SqliteStore::memory().unwrap();
+    let mut job = DurableJob::schedule("job-1", "remind me", 2000, 1000).unwrap();
+    job.objective.clear();
+    assert!(store.save_job(&job).is_err());
 }

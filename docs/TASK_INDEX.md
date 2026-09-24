@@ -1,6 +1,14 @@
 # Task Index
 
-This is the single implementation ledger. No mock or source-only implementation counts as a live-device acceptance pass.
+> **Historical implementation evidence.** New Jarvis restructuring work, dependency
+> order and parallel ownership are authoritative in
+> [`ATHERA_DEVELOPMENT_TASK_GRAPH.md`](ATHERA_DEVELOPMENT_TASK_GRAPH.md). Preserve the
+> evidence below when migrating completed work into the new graph.
+
+This was the original implementation ledger. It is retained as historical
+evidence; current task state lives in `ATHERA_DEVELOPMENT_TASK_GRAPH.md` and
+`ATHERA_STATUS_AUDIT_2026-09-23.md`. No mock or source-only implementation
+counts as a live-device acceptance pass.
 
 ## Web credential entry verification
 
@@ -90,8 +98,8 @@ defines each gate; its backend, mobile and evaluation playbooks provide work pac
 | VS00 | Reproducible backend, frontend and external-eval setup | None | DONE | Rust/Cargo 1.98.1, Node 24.21.0, JDK 22.0.2, Python 3.11.15, DeepEval 4.2.2, Android API 36/NDK 27.2.12479018/ADB 37.0.1; 57 Rust tests, 16 mobile tests plus launcher, production build, all JSONL fixtures, nine eval harness tests, dataset lint and real-runner DeepEval smoke pass; 390x844 dark render has no overflow or JS errors; physical device absent and live profiles remain explicitly blocked |
 | VS01 | Common execution stream and structured output | VS00 | DONE | `aethra.output.v1` validates Markdown/list/table blocks; migrations 003/004 persist `aethra.run-event.v1` with stable task/run IDs, worker lifecycle, bounded text deltas, block upsert, one terminal event, paging and stale-cursor reset. Responses and Chat Completions SSE parsers have fragmented-stream/tool-argument tests; late deltas are discarded. Five real-runner fixtures include streaming output; JSON-lines/browser bridge parity matches eight normalized events. Integrated evidence: 69 Rust tests, ten eval-harness tests, 18 mobile tests plus launcher, production build, real-runner DeepEval smoke, and 390x844 structured and streaming renders pass. Live cloud inference remains credential-dependent evidence and is not claimed by this deterministic gate |
 | VS02 | Public Parallel search with cited evidence | VS01 | BLOCKED | Versioned anonymous Streamable HTTP manifest, Parallel preset, canonical `web.search`/`web.open`, bounded raw/context separation, source blocks, exact recorded fixture, injection/size failures, and dated live anonymous discovery/query pass. Integrated evidence: 85 Rust tests, ten eval-harness tests, 21 mobile tests, DeepEval real-runner smoke, production build, and 390x844 source render. No cloud credential is configured in the build environment, so the required live cloud-model selection and cited synthesis run remains externally blocked |
-| VS03 | Authenticated MCP connections | VS02 | IN_PROGRESS | Tagged anonymous/Bearer/API-key/OAuth manifests, strict HTTPS/header/resource validation, exact credential binding, session-only resolver, pre-I/O auth pause, redirect denial, MCP 401 mapping, redacted typed status, endpoint-change/restart/secret-leak regressions, and mobile static/OAuth setup pass. Host OAuth covers Bearer challenges, RFC discovery order, extensible metadata, preregistration/CIMD/DCR selection and public DCR, 256-bit S256 PKCE, resource/redirect/state binding, expiry/replay denial, bounded code exchange, exact token ownership, refresh rotation, transport recreation, and one-time task resume. Dated live Parallel metadata discovery passed (`C4BAD…7A82`). Android Custom Tabs/App Links/Keystore, step-up challenge propagation, and live token/authenticated-call proof remain pending |
-| VS04 | Bounded graph and parallel read workers | VS03 | IN_PROGRESS | Vendor-neutral persisted graph contracts now validate DAG shape, exact task/node/worker binding, unique idempotency keys, deadlines, retry/attempt budgets, 64 KiB worker context, 1-4 concurrency and read-only tool execution. Deterministic readiness, lease/running/outcome transitions, bounded retry, restart recovery, cancellation, partial joins and duplicate-outcome denial have contract tests. Planner proposal expansion, Assistant scheduling/persistence events, concurrent real-runtime/restart traces and plan/tool DeepEval report remain pending |
+| VS03 | Authenticated MCP connections | VS02 | IN_PROGRESS | Tagged anonymous/Bearer/API-key/OAuth manifests, exact credential binding, session-only resolver, strict HTTPS/redirect policy, bounded OAuth discovery and exchange, refresh rotation, one-time task resume, normalized OAuth endpoint failures, and redacted `aethra.connection-state.v1` states are implemented. Validated 401 Bearer challenges propagate authorization-server and requested-scope context; insufficient-scope state is surfaced without leaking tokens. Android now launches Custom Tabs, accepts only an exact HTTPS App Link callback, and persists bound OAuth token records behind AES-GCM Android Keystore handles without exposing callback URLs or tokens to React. Remaining gates: configure and verify a real App Link domain/assetlinks file, cover upstream 403 behavior, and record live consent/token/authenticated-call evidence on a device |
+| VS04 | Bounded graph and parallel read workers | VS03 | IN_PROGRESS | Vendor-neutral persisted graph contracts validate bounded DAG proposals and Rust expands model proposals into authoritative IDs, deadlines, idempotency keys, retry limits and a maximum of two concurrent read-only workers. The Assistant scheduler revalidates current tool state, persists lease/running/outcome transitions, emits worker events, joins in graph order, cancels descendants, discards late work and recovers safe nodes after restart. Startup now enumerates unfinished graphs beyond the UI page limit and safely resumes eligible nodes; regression tests cover auth pause/resume, stale/disabled tools, policy changes, cancellation and non-replay of writes. The deterministic plan/tool report now verifies two workers start before either completes and results remain ordered. Only live model-quality measurement remains external |
 | VS05 | Rich Parallel research and monitoring | VS04 | TODO | Typed output/source tests; signed/deduplicated webhook fixture; dated live Task result |
 | VS06 | Supervised on-device Needle action worker | VS03 VS04 | TODO | Exact policy fixtures; real Needle output; controlled physical action logs and device metrics |
 | VS07 | Voice and document inputs | VS06 | TODO | Permission/cancel/grounding tests; physical voice and supported-document evidence |
@@ -100,8 +108,11 @@ defines each gate; its backend, mobile and evaluation playbooks provide work pac
 
 VS00 completed on 2026-09-13. VS01 completed on 2026-09-14. VS02's local and live
 anonymous-search work is complete, but its configured cloud-model gate is blocked by
-the absence of a cloud credential in the build environment. VS03 host work has begun
-with static credential profiles and binding; its OAuth and Android gates remain open.
+the absence of a cloud credential in the build environment. VS03 now has the host
+OAuth flow and the Android browser/callback/Keystore boundary, but durable Android
+token storage, a verified production App Link and live authenticated proof remain
+open. VS04 has an integrated bounded scheduler and automatic safe startup recovery;
+its plan/tool quality report remains open.
 
 ## Historical companion implementation ledger (2026-09-11)
 

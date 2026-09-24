@@ -6,7 +6,7 @@ use adapter_mcp::{
     OAuthHttpClient, OAuthTokenSet,
 };
 use assistant_contracts::{Error, Id, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -72,22 +72,100 @@ struct TokenCredential {
     client_id: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTokenCredential {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<u64>,
+    granted_scopes: Vec<String>,
+    token_endpoint: String,
+    client_id: String,
+}
+
+/// Platform-owned durable storage. Handles and bindings are non-secret; values are secret.
+pub trait OAuthTokenVault: Send + Sync {
+    fn store(&self, handle: &str, binding: &str, value: &str) -> Result<()>;
+    fn load(&self, handle: &str, binding: &str) -> Result<Option<String>>;
+    fn delete(&self, handle: &str) -> Result<()>;
+}
+
 /// Owns one-time OAuth transactions and connection-bound token sets.
 pub struct OAuthRuntime {
     fallback: Arc<SessionSecrets>,
     http: OAuthHttpClient,
     pending: Mutex<BTreeMap<Id, PendingAuthorization>>,
     tokens: Mutex<BTreeMap<String, TokenCredential>>,
+    vault: Option<Arc<dyn OAuthTokenVault>>,
 }
 
 impl OAuthRuntime {
+    #[cfg(test)]
     pub fn new(fallback: Arc<SessionSecrets>) -> Result<Self> {
-        Ok(Self {
+        Self::with_vault(fallback, None, &[])
+    }
+
+    pub(crate) fn with_vault(
+        fallback: Arc<SessionSecrets>,
+        vault: Option<Arc<dyn OAuthTokenVault>>,
+        connections: &[ConnectionConfig],
+    ) -> Result<Self> {
+        let runtime = Self {
             fallback,
             http: OAuthHttpClient::new()?,
             pending: Mutex::new(BTreeMap::new()),
             tokens: Mutex::new(BTreeMap::new()),
-        })
+            vault,
+        };
+        runtime.restore(connections)?;
+        Ok(runtime)
+    }
+
+    fn restore(&self, connections: &[ConnectionConfig]) -> Result<()> {
+        let Some(vault) = &self.vault else {
+            return Ok(());
+        };
+        for config in connections {
+            let Some(binding) = config.credential_request()? else {
+                continue;
+            };
+            if binding.purpose != CredentialPurpose::OauthAccessToken {
+                continue;
+            }
+            let aad = credential_binding(&binding)?;
+            let value = match vault.load(&binding.secret_ref, &aad) {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(Error::AuthRequired | Error::Denied) => {
+                    vault.delete(&binding.secret_ref)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if value.len() > 65_536 {
+                vault.delete(&binding.secret_ref)?;
+                continue;
+            }
+            let stored: StoredTokenCredential = match serde_json::from_str(&value) {
+                Ok(stored) => stored,
+                Err(_) => {
+                    vault.delete(&binding.secret_ref)?;
+                    continue;
+                }
+            };
+            let credential = match stored.into_credential(binding.clone()) {
+                Ok(credential) => credential,
+                Err(_) => {
+                    vault.delete(&binding.secret_ref)?;
+                    continue;
+                }
+            };
+            self.tokens
+                .lock()
+                .map_err(|_| Error::Unavailable)?
+                .insert(binding.connection_id, credential);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -230,22 +308,51 @@ impl OAuthRuntime {
                 token.refresh_token.clone().ok_or(Error::AuthRequired)?,
             )
         };
+        let stale_refresh_token = refresh.2.clone();
         let updated = self
             .http
             .refresh(&refresh.0, &refresh.1, &binding.resource, refresh.2, now()?)
-            .await?;
-        self.commit_tokens(binding.clone(), updated, refresh.0, refresh.1)
+            .await;
+        match updated {
+            Ok(updated) => self.commit_tokens(binding.clone(), updated, refresh.0, refresh.1),
+            Err(error @ (Error::AuthRequired | Error::Denied)) => {
+                self.clear_revoked_refresh(binding, &stale_refresh_token)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn clear(&self, connection_id: &str) -> Result<()> {
-        self.tokens
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .remove(connection_id);
+        let mut tokens = self.tokens.lock().map_err(|_| Error::Unavailable)?;
+        if let Some(token) = tokens.get(connection_id) {
+            if let Some(vault) = &self.vault {
+                vault.delete(&token.binding.secret_ref)?;
+            }
+        }
+        tokens.remove(connection_id);
+        drop(tokens);
         self.pending
             .lock()
             .map_err(|_| Error::Unavailable)?
             .retain(|_, pending| pending.transaction.connection_id != connection_id);
+        Ok(())
+    }
+
+    fn clear_revoked_refresh(
+        &self,
+        binding: &CredentialRequest,
+        refresh_token: &str,
+    ) -> Result<()> {
+        let mut tokens = self.tokens.lock().map_err(|_| Error::Unavailable)?;
+        if tokens.get(&binding.connection_id).is_some_and(|token| {
+            token.binding == *binding && token.refresh_token.as_deref() == Some(refresh_token)
+        }) {
+            if let Some(vault) = &self.vault {
+                vault.delete(&binding.secret_ref)?;
+            }
+            tokens.remove(&binding.connection_id);
+        }
         Ok(())
     }
 
@@ -335,12 +442,105 @@ impl OAuthRuntime {
             token_endpoint,
             client_id,
         };
+        if let Some(vault) = &self.vault {
+            let aad = credential_binding(&binding)?;
+            let value = serde_json::to_string(&StoredTokenCredential::from(&credential))
+                .map_err(|_| Error::Unavailable)?;
+            if value.len() > 65_536 {
+                return Err(Error::InvalidResponse);
+            }
+            vault.store(&binding.secret_ref, &aad, &value)?;
+        }
         self.tokens
             .lock()
             .map_err(|_| Error::Unavailable)?
             .insert(binding.connection_id, credential);
         Ok(())
     }
+}
+
+impl From<&TokenCredential> for StoredTokenCredential {
+    fn from(value: &TokenCredential) -> Self {
+        Self {
+            access_token: value.access_token.clone(),
+            refresh_token: value.refresh_token.clone(),
+            expires_at: value.expires_at,
+            granted_scopes: value.granted_scopes.clone(),
+            token_endpoint: value.token_endpoint.clone(),
+            client_id: value.client_id.clone(),
+        }
+    }
+}
+
+impl StoredTokenCredential {
+    fn into_credential(self, binding: CredentialRequest) -> Result<TokenCredential> {
+        SessionSecrets::validate(&self.access_token)?;
+        if let Some(refresh) = &self.refresh_token {
+            SessionSecrets::validate(refresh)?;
+        }
+        ensure_scope_grant(&binding.requested_scopes, &self.granted_scopes)?;
+        if self.granted_scopes.len() > 32
+            || self.granted_scopes.iter().any(|scope| {
+                scope.is_empty()
+                    || scope.len() > 200
+                    || !scope
+                        .bytes()
+                        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+            })
+        {
+            return Err(Error::Denied);
+        }
+        let endpoint = reqwest::Url::parse(&self.token_endpoint).map_err(|_| Error::Denied)?;
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.fragment().is_some()
+            || self.client_id.is_empty()
+            || self.client_id.len() > 2048
+            || self.client_id.chars().any(char::is_control)
+        {
+            return Err(Error::Denied);
+        }
+        Ok(TokenCredential {
+            binding,
+            access_token: self.access_token,
+            refresh_token: self.refresh_token,
+            expires_at: self.expires_at,
+            granted_scopes: self.granted_scopes,
+            token_endpoint: self.token_endpoint,
+            client_id: self.client_id,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct CredentialBinding<'a> {
+    connection_id: &'a str,
+    origin: &'a str,
+    resource: &'a str,
+    purpose: &'static str,
+    secret_ref: &'a str,
+    authorization_server: &'a Option<String>,
+    requested_scopes: &'a [String],
+}
+
+fn credential_binding(binding: &CredentialRequest) -> Result<String> {
+    let purpose = match binding.purpose {
+        CredentialPurpose::BearerToken => "bearer_token",
+        CredentialPurpose::ApiKeyHeader => "api_key_header",
+        CredentialPurpose::OauthAccessToken => "oauth_access_token",
+    };
+    serde_json::to_string(&CredentialBinding {
+        connection_id: &binding.connection_id,
+        origin: &binding.origin,
+        resource: &binding.resource,
+        purpose,
+        secret_ref: &binding.secret_ref,
+        authorization_server: &binding.authorization_server,
+        requested_scopes: &binding.requested_scopes,
+    })
+    .map_err(|_| Error::Unavailable)
 }
 
 #[async_trait::async_trait]
@@ -411,9 +611,9 @@ fn contains_secret(value: &serde_json::Value, secret: &str) -> bool {
         serde_json::Value::Array(values) => {
             values.iter().any(|value| contains_secret(value, secret))
         }
-        serde_json::Value::Object(values) => {
-            values.values().any(|value| contains_secret(value, secret))
-        }
+        serde_json::Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains(secret) || contains_secret(value, secret)),
         _ => false,
     }
 }
@@ -425,6 +625,38 @@ mod tests {
         AuthorizationServerMetadata, McpTransport, ProtectedResourceMetadata,
         MCP_CONNECTION_SCHEMA_V1,
     };
+
+    #[derive(Default)]
+    struct MemoryVault {
+        values: Mutex<BTreeMap<(String, String), String>>,
+    }
+
+    impl OAuthTokenVault for MemoryVault {
+        fn store(&self, handle: &str, binding: &str, value: &str) -> Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert((handle.to_owned(), binding.to_owned()), value.to_owned());
+            Ok(())
+        }
+
+        fn load(&self, handle: &str, binding: &str) -> Result<Option<String>> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .get(&(handle.to_owned(), binding.to_owned()))
+                .cloned())
+        }
+
+        fn delete(&self, handle: &str) -> Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .retain(|(stored_handle, _), _| stored_handle != handle);
+            Ok(())
+        }
+    }
 
     fn connection(scopes: &[&str]) -> ConnectionConfig {
         ConnectionConfig {
@@ -542,10 +774,87 @@ mod tests {
         assert_eq!(status.granted_scopes, vec!["read".to_string()]);
         assert_eq!(runtime.resolve(&binding).unwrap(), access);
         assert!(runtime.payload_contains_secret(&serde_json::json!({"text":refresh})));
+        assert!(runtime.payload_contains_secret(&serde_json::json!({refresh:"safe-value"})));
         let mut wrong_binding = binding.clone();
         wrong_binding.resource = "https://mcp.example.com/other".into();
         assert_eq!(runtime.resolve(&wrong_binding), Err(Error::AuthRequired));
-        runtime.clear(&config.id).unwrap();
+        let mut wrong_issuer = binding.clone();
+        wrong_issuer.authorization_server = Some("https://other-auth.example.com".into());
+        assert_eq!(runtime.resolve(&wrong_issuer), Err(Error::AuthRequired));
+        let mut escalated_scope = binding.clone();
+        escalated_scope.requested_scopes.push("write".into());
+        assert_eq!(runtime.resolve(&escalated_scope), Err(Error::AuthRequired));
+        runtime
+            .clear_revoked_refresh(&binding, "a-concurrently-replaced-refresh")
+            .unwrap();
+        assert_eq!(runtime.resolve(&binding).unwrap(), access);
+        runtime.clear_revoked_refresh(&binding, refresh).unwrap();
         assert_eq!(runtime.resolve(&binding), Err(Error::AuthRequired));
+    }
+
+    #[test]
+    fn platform_vault_restores_exact_binding_and_deletes_by_opaque_handle() {
+        let vault = Arc::new(MemoryVault::default());
+        let config = connection(&["read"]);
+        let binding = config.credential_request().unwrap().unwrap();
+        let runtime = OAuthRuntime::with_vault(
+            Arc::new(SessionSecrets::default()),
+            Some(vault.clone()),
+            &[],
+        )
+        .unwrap();
+        runtime
+            .commit_tokens(
+                binding.clone(),
+                OAuthTokenSet {
+                    access_token: "durable-access-token".into(),
+                    refresh_token: Some("durable-refresh-token".into()),
+                    expires_at: Some(now().unwrap() + 3600),
+                    granted_scopes: vec!["read".into()],
+                },
+                "https://auth.example.com/token".into(),
+                "public-client".into(),
+            )
+            .unwrap();
+
+        let values = vault.values.lock().unwrap();
+        let ((handle, aad), encrypted_payload) = values.first_key_value().unwrap();
+        assert_eq!(handle, "keystore:fixture");
+        assert!(aad.contains("https://auth.example.com"));
+        assert!(!aad.contains("durable-access-token"));
+        assert!(encrypted_payload.contains("durable-access-token"));
+        drop(values);
+
+        let restored = OAuthRuntime::with_vault(
+            Arc::new(SessionSecrets::default()),
+            Some(vault.clone()),
+            std::slice::from_ref(&config),
+        )
+        .unwrap();
+        assert_eq!(restored.resolve(&binding).unwrap(), "durable-access-token");
+        restored.clear(&config.id).unwrap();
+        assert!(vault.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn platform_vault_discards_invalid_persisted_credentials() {
+        let vault = Arc::new(MemoryVault::default());
+        let config = connection(&["read"]);
+        let binding = config.credential_request().unwrap().unwrap();
+        vault.values.lock().unwrap().insert(
+            (
+                binding.secret_ref.clone(),
+                credential_binding(&binding).unwrap(),
+            ),
+            "not-json".into(),
+        );
+        let runtime = OAuthRuntime::with_vault(
+            Arc::new(SessionSecrets::default()),
+            Some(vault.clone()),
+            std::slice::from_ref(&config),
+        )
+        .unwrap();
+        assert_eq!(runtime.status(&config).unwrap().state, OAuthState::Missing);
+        assert!(vault.values.lock().unwrap().is_empty());
     }
 }

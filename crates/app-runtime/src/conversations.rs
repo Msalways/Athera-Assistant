@@ -1,5 +1,5 @@
 //! Local conversation lifecycle. It never dispatches tools or silently routes to cloud.
-use assistant_contracts::{conversation::*, Error, Id, Result};
+use assistant_contracts::{conversation::*, Error, Id, PersonalizationStore, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -197,12 +197,21 @@ impl Conversations {
         }
         let request = (|| -> Result<ConversationRequest> {
             let (conversation, messages) = self.read(&state, id)?;
-            let memories = if input.temporary {
-                vec![]
-            } else {
-                self.store.list_memories(100)?
-            };
-            let mut request = bounded_context(&conversation, messages, memories);
+            let query = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::User)
+                .map(|m| m.content.as_str())
+                .unwrap_or_default();
+            let personal =
+                assistant_core::personalization::PersonalizationService::new(self.store.as_ref())
+                    .context(id, None, query, input.temporary)?;
+            let mut request = bounded_context(&conversation, messages, personal.memories.clone());
+            request.personal = personal;
+            if !input.temporary {
+                self.store
+                    .record_personal_usage(assistant.id, id, &request.personal.rules)?;
+            }
             if !input.temporary {
                 add_research_context(&mut request, self.store.list_research_sessions(id, 3)?);
             }
@@ -318,6 +327,7 @@ fn bounded_context(
         .take(4)
         .collect();
     ConversationRequest {
+        personal: Default::default(),
         messages: selected,
         summary,
         memories,

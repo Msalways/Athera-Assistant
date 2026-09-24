@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 use storage_sqlite::SqliteStore;
 
 fn input(source: InputSource) -> UserInput {
@@ -779,6 +780,43 @@ async fn auth_pause_resumes_the_pending_step() {
     assert_eq!(done.result_refs, vec![pending]);
     assert_eq!(done.status, TaskStatus::Completed);
 }
+
+#[tokio::test]
+async fn auth_failure_after_write_dispatch_is_never_replayed() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    registry::register(
+        store.as_ref(),
+        &Capability::Tool(example_tool(Risk::ExternalWrite)),
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new(true, vec![call()]));
+    let executor = Arc::new(AuthExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let assistant = Assistant::new(
+        store,
+        provider.clone(),
+        provider,
+        executor.clone(),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let waiting = assistant.run(task.id).await.unwrap();
+    let approval = waiting.pending.unwrap().id;
+    assistant.approve(task.id, approval, true).unwrap();
+
+    let uncertain = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(uncertain.status, TaskStatus::WaitingForResolution);
+    assert!(uncertain.pending.unwrap().started);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(assistant.resume_auth(task.id).unwrap_err(), Error::Conflict);
+    assert_eq!(
+        assistant.run(task.id).await.unwrap().status,
+        TaskStatus::WaitingForResolution
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
 struct SlowProvider {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -842,4 +880,501 @@ async fn cancellation_discards_late_model_tool_call() {
     assert!(!events
         .iter()
         .any(|event| event.kind == RunEventKind::OutputUpsert));
+}
+
+fn graph_proposal(nodes: Vec<ProposedWorkNode>) -> AgentAction {
+    AgentAction::PlanGraph {
+        proposal: WorkGraphProposal {
+            schema: WORK_GRAPH_PROPOSAL_SCHEMA_V1.into(),
+            nodes,
+        },
+    }
+}
+
+fn infer_node(key: &str, dependencies: &[&str]) -> ProposedWorkNode {
+    ProposedWorkNode {
+        key: key.into(),
+        objective: key.into(),
+        operation: WorkerOperation::Infer,
+        dependencies: dependencies.iter().map(|value| (*value).into()).collect(),
+        dependency_policy: DependencyPolicy::AllSucceeded,
+    }
+}
+
+struct ParallelGraphProvider {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for ParallelGraphProvider {
+    fn id(&self) -> &str {
+        "parallel-graph-fixture"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    async fn infer(&self, context: ContextBundle) -> Result<AgentAction> {
+        match context.role {
+            Role::Planner => Ok(graph_proposal(vec![
+                infer_node("first", &[]),
+                infer_node("second", &[]),
+            ])),
+            Role::Reasoner => {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                let delay = if context.goal == "first" { 40 } else { 5 };
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(AgentAction::Respond { text: context.goal })
+            }
+            Role::Responder => Ok(respond()),
+            Role::Fast => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn planner_graph_runs_two_workers_concurrently_and_joins_in_graph_order() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let provider = Arc::new(ParallelGraphProvider {
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+    });
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ToolOnlyProvider),
+        provider.clone(),
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let mut task = assistant.submit(input(InputSource::Text)).unwrap();
+    task.role = Role::Planner;
+    store.save_task(&task).unwrap();
+
+    let done = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(done.status, TaskStatus::Completed);
+    assert_eq!(provider.max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(done.result_refs.len(), 2);
+    assert_eq!(
+        store.result(done.result_refs[0]).unwrap()["response"],
+        "first"
+    );
+    assert_eq!(
+        store.result(done.result_refs[1]).unwrap()["response"],
+        "second"
+    );
+    assert!(done
+        .work_graph
+        .unwrap()
+        .nodes
+        .iter()
+        .all(|node| node.state == WorkNodeState::Completed));
+}
+
+struct HangingGraphProvider {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for HangingGraphProvider {
+    fn id(&self) -> &str {
+        "hanging-graph-fixture"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    async fn infer(&self, context: ContextBundle) -> Result<AgentAction> {
+        match context.role {
+            Role::Planner => Ok(graph_proposal(vec![
+                infer_node("root", &[]),
+                infer_node("descendant", &["root"]),
+            ])),
+            Role::Reasoner => {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+            Role::Responder => Ok(respond()),
+            Role::Fast => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn graph_cancellation_aborts_active_work_and_cancels_descendants() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(HangingGraphProvider {
+        entered: entered.clone(),
+    });
+    let assistant = Arc::new(Assistant::new(
+        store.clone(),
+        Arc::new(ToolOnlyProvider),
+        provider,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    ));
+    let mut task = assistant.submit(input(InputSource::Text)).unwrap();
+    task.role = Role::Planner;
+    store.save_task(&task).unwrap();
+    let running = assistant.clone();
+    let handle = tokio::spawn(async move { running.run(task.id).await.unwrap() });
+    entered.notified().await;
+
+    assistant.cancel(task.id).unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert!(cancelled
+        .work_graph
+        .unwrap()
+        .nodes
+        .iter()
+        .all(|node| node.state == WorkNodeState::Cancelled));
+}
+
+struct ResumeGraphProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for ResumeGraphProvider {
+    fn id(&self) -> &str {
+        "resume-graph-fixture"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    async fn infer(&self, context: ContextBundle) -> Result<AgentAction> {
+        match context.role {
+            Role::Reasoner => Ok(AgentAction::Respond {
+                text: "recovered".into(),
+            }),
+            Role::Responder => Ok(respond()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn interrupted_infer_task(status: TaskStatus) -> Task {
+    let mut task = Task::new(input(InputSource::Text));
+    task.status = status;
+    let node_id = Id::new_v4();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    task.work_graph = Some(WorkGraph {
+        schema: WORK_GRAPH_SCHEMA_V1.into(),
+        task_id: task.id,
+        created_at: at.saturating_sub(1),
+        deadline_at: at + 60,
+        max_parallel_workers: 2,
+        nodes: vec![WorkNode {
+            id: node_id,
+            task_id: task.id,
+            idempotency_key: format!("{}:0:recover", task.id),
+            deadline_at: at + 60,
+            retry_budget: 1,
+            attempts: 1,
+            state: WorkNodeState::Running,
+            dependency_policy: DependencyPolicy::AllSucceeded,
+            request: WorkerRequest {
+                worker_id: Id::new_v4(),
+                node_id,
+                task_id: task.id,
+                objective: "recover safe work".into(),
+                operation: WorkerOperation::Infer,
+                context: ContextBundle {
+                    task_id: task.id,
+                    role: Role::Reasoner,
+                    goal: "recover safe work".into(),
+                    plan: vec![],
+                    handoff: None,
+                    history: vec![],
+                    results: vec![],
+                    skills: vec![],
+                    candidates: vec![],
+                    tools: vec![],
+                    adaptive_rules: vec![],
+                },
+            },
+            result_refs: vec![],
+        }],
+        edges: vec![],
+    });
+    task
+}
+
+#[tokio::test]
+async fn startup_recovery_runs_only_active_retry_safe_graphs() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let safe = interrupted_infer_task(TaskStatus::Running);
+    let paused = interrupted_infer_task(TaskStatus::WaitingForAuth);
+    let mut changed_tool = interrupted_infer_task(TaskStatus::Running);
+    let read = example_tool(Risk::ReadOnly);
+    let call = ToolCall {
+        tool_id: read.id.clone(),
+        version: read.version.clone(),
+        arguments: json!({"text":"hello"}),
+    };
+    let node = &mut changed_tool.work_graph.as_mut().unwrap().nodes[0];
+    node.request.operation = WorkerOperation::CallTool { call: call.clone() };
+    node.request.context.tools = vec![read.clone()];
+    store.save_task(&safe).unwrap();
+    store.save_task(&paused).unwrap();
+    store.save_task(&changed_tool).unwrap();
+    let mut write = read;
+    write.risk = Risk::ExternalWrite;
+    store.put_capability(&Capability::Tool(write)).unwrap();
+
+    let executor = Arc::new(CountingExecutor(AtomicUsize::new(0)));
+    let provider = Arc::new(ResumeGraphProvider);
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ToolOnlyProvider),
+        provider,
+        executor.clone(),
+        EngineConfig::default(),
+    );
+
+    assert_eq!(
+        assistant.recover_unfinished_graphs().unwrap(),
+        vec![safe.id]
+    );
+    assert_eq!(
+        store.task(safe.id).unwrap().work_graph.unwrap().nodes[0].state,
+        WorkNodeState::Queued
+    );
+    assert_eq!(
+        store.task(paused.id).unwrap().status,
+        TaskStatus::WaitingForAuth
+    );
+    assert_eq!(
+        store.task(changed_tool.id).unwrap().status,
+        TaskStatus::Failed
+    );
+    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+
+    let done = assistant.run(safe.id).await.unwrap();
+    assert_eq!(done.status, TaskStatus::Completed);
+}
+
+struct RecoveringAuthProvider(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ModelProvider for RecoveringAuthProvider {
+    fn id(&self) -> &str {
+        "recovering-auth-fixture"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    async fn infer(&self, context: ContextBundle) -> Result<AgentAction> {
+        match context.role {
+            Role::Reasoner if self.0.fetch_add(1, Ordering::SeqCst) == 0 => {
+                Err(Error::AuthRequired)
+            }
+            Role::Reasoner => Ok(AgentAction::Respond {
+                text: "recovered".into(),
+            }),
+            Role::Responder => Ok(respond()),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovered_graph_auth_pause_is_retryable_without_consuming_budget() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let task = interrupted_infer_task(TaskStatus::Running);
+    store.save_task(&task).unwrap();
+    let provider = Arc::new(RecoveringAuthProvider(AtomicUsize::new(0)));
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ToolOnlyProvider),
+        provider,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    assert_eq!(
+        assistant.recover_unfinished_graphs().unwrap(),
+        vec![task.id]
+    );
+
+    let waiting = assistant.run(task.id).await.unwrap();
+    assert_eq!(waiting.status, TaskStatus::WaitingForAuth);
+    assert_eq!(waiting.failures, 0);
+    assert_eq!(
+        waiting.work_graph.as_ref().unwrap().nodes[0].state,
+        WorkNodeState::Queued
+    );
+    let attempts = waiting.work_graph.as_ref().unwrap().nodes[0].attempts;
+
+    assistant.resume_auth(task.id).unwrap();
+    let done = assistant.run(task.id).await.unwrap();
+    assert_eq!(done.status, TaskStatus::Completed);
+    assert_eq!(done.failures, 0);
+    assert_eq!(done.work_graph.unwrap().nodes[0].attempts, attempts + 1);
+}
+
+#[tokio::test]
+async fn restart_requeues_only_interrupted_safe_graph_work() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let first_provider = Arc::new(HangingGraphProvider {
+        entered: entered.clone(),
+    });
+    let first = Arc::new(Assistant::new(
+        store.clone(),
+        Arc::new(ToolOnlyProvider),
+        first_provider,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    ));
+    let mut task = first.submit(input(InputSource::Text)).unwrap();
+    task.role = Role::Planner;
+    store.save_task(&task).unwrap();
+    let running = first.clone();
+    let handle = tokio::spawn(async move { running.run(task.id).await.unwrap() });
+    entered.notified().await;
+    handle.abort();
+    assert!(handle.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        store.task(task.id).unwrap().work_graph.unwrap().nodes[0].state,
+        WorkNodeState::Running
+    );
+
+    let resumed_provider = Arc::new(ResumeGraphProvider);
+    let resumed = Assistant::new(
+        store.clone(),
+        Arc::new(ToolOnlyProvider),
+        resumed_provider,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let done = resumed.run(task.id).await.unwrap();
+
+    assert_eq!(done.status, TaskStatus::Completed);
+    let graph = done.work_graph.unwrap();
+    assert_eq!(graph.nodes[0].attempts, 2);
+    assert_eq!(graph.nodes[0].state, WorkNodeState::Completed);
+    assert_eq!(graph.nodes[1].state, WorkNodeState::Completed);
+}
+
+struct CountingExecutor(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ToolExecutor for CountingExecutor {
+    async fn execute(&self, _: &ToolSpec, _: &ToolCall) -> Result<serde_json::Value> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"unexpected": true}))
+    }
+}
+
+#[tokio::test]
+async fn recovered_graph_revalidates_current_tool_spec_before_execution() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let original = example_tool(Risk::ReadOnly);
+    registry::register(store.as_ref(), &Capability::Tool(original.clone())).unwrap();
+    let mut task = Task::new(input(InputSource::Text));
+    task.status = TaskStatus::Running;
+    let node_id = Id::new_v4();
+    let worker_id = Id::new_v4();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    task.work_graph = Some(WorkGraph {
+        schema: WORK_GRAPH_SCHEMA_V1.into(),
+        task_id: task.id,
+        created_at: now,
+        deadline_at: now + 60,
+        max_parallel_workers: 2,
+        nodes: vec![WorkNode {
+            id: node_id,
+            task_id: task.id,
+            idempotency_key: format!("{}:0:tool", task.id),
+            deadline_at: now + 60,
+            retry_budget: 1,
+            attempts: 1,
+            state: WorkNodeState::Running,
+            dependency_policy: DependencyPolicy::AllSucceeded,
+            request: WorkerRequest {
+                worker_id,
+                node_id,
+                task_id: task.id,
+                objective: "read".into(),
+                operation: WorkerOperation::CallTool {
+                    call: ToolCall {
+                        tool_id: original.id.clone(),
+                        version: original.version.clone(),
+                        arguments: json!({"text":"hello"}),
+                    },
+                },
+                context: ContextBundle {
+                    task_id: task.id,
+                    role: Role::Reasoner,
+                    goal: "read".into(),
+                    plan: vec![],
+                    handoff: None,
+                    history: vec![],
+                    results: vec![],
+                    skills: vec![],
+                    candidates: vec![],
+                    tools: vec![original.clone()],
+                    adaptive_rules: vec![],
+                },
+            },
+            result_refs: vec![],
+        }],
+        edges: vec![],
+    });
+    store.save_task(&task).unwrap();
+    let mut disabled = original;
+    disabled.enabled = false;
+    registry::register(store.as_ref(), &Capability::Tool(disabled)).unwrap();
+    let executor = Arc::new(CountingExecutor(AtomicUsize::new(0)));
+    let assistant = Assistant::new(
+        store,
+        Arc::new(ToolOnlyProvider),
+        Arc::new(ScriptedProvider::new(false, vec![])),
+        executor.clone(),
+        EngineConfig::default(),
+    );
+
+    let failed = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        failed.work_graph.unwrap().nodes[0].state,
+        WorkNodeState::Failed
+    );
 }

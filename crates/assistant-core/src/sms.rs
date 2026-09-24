@@ -332,6 +332,7 @@ pub fn packet(
         history: vec![],
         skills: vec![],
         candidates: vec![],
+        adaptive_rules: vec![],
     }
 }
 

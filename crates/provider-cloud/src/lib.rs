@@ -72,6 +72,27 @@ pub struct CloudProvider {
     secrets: Arc<dyn SecretStore>,
     cooldown_until: Mutex<Option<Instant>>,
 }
+
+/// A safe, user-facing outcome for validating a cloud configuration. Provider
+/// response bodies are deliberately not surfaced because they are untrusted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConnectionTest {
+    pub state: ConnectionTestState,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionTestState {
+    Connected,
+    AuthenticationRequired,
+    InvalidConfiguration,
+    RateLimited,
+    TimedOut,
+    Unavailable,
+}
+
 impl CloudProvider {
     pub fn new(config: CloudConfig, secrets: Arc<dyn SecretStore>) -> Result<Self> {
         let url = Url::parse(&config.endpoint).map_err(|_| Error::InvalidInput)?;
@@ -108,6 +129,56 @@ impl CloudProvider {
                 json!({"model":self.config.model,"messages":[{"role":"system","content":protocol::POLICY},{"role":"user","content":packet}],"max_tokens":self.config.max_output_tokens,"parallel_tool_calls":false,"tools":functions.into_iter().map(|f| json!({"type":"function","function":f})).collect::<Vec<_>>() })
             }
         })
+    }
+
+    /// Sends a one-token request to validate the configured endpoint, model and
+    /// credential without persisting a provider conversation or invoking tools.
+    pub async fn test_connection(&self) -> ConnectionTest {
+        let secret = match self.secrets.get(&self.config.secret_ref) {
+            Ok(secret) => secret,
+            Err(Error::AuthRequired) => {
+                return connection_test(ConnectionTestState::AuthenticationRequired)
+            }
+            Err(_) => return connection_test(ConnectionTestState::Unavailable),
+        };
+        let suffix = match self.config.api {
+            ApiKind::Responses => "responses",
+            ApiKind::ChatCompletions => "chat/completions",
+        };
+        let body = match self.config.api {
+            ApiKind::Responses => json!({
+                "model": self.config.model,
+                "input": "Reply with OK.",
+                "max_output_tokens": 1,
+                "store": false,
+            }),
+            ApiKind::ChatCompletions => json!({
+                "model": self.config.model,
+                "messages": [{"role": "user", "content": "Reply with OK."}],
+                "max_tokens": 1,
+            }),
+        };
+        match self
+            .client
+            .post(format!(
+                "{}/{suffix}",
+                self.config.endpoint.trim_end_matches('/')
+            ))
+            .bearer_auth(secret)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => match response.status().as_u16() {
+                200..=299 => connection_test(ConnectionTestState::Connected),
+                401 | 403 => connection_test(ConnectionTestState::AuthenticationRequired),
+                400 | 404 | 405 | 422 => connection_test(ConnectionTestState::InvalidConfiguration),
+                429 => connection_test(ConnectionTestState::RateLimited),
+                _ => connection_test(ConnectionTestState::Unavailable),
+            },
+            Err(error) if error.is_timeout() => connection_test(ConnectionTestState::TimedOut),
+            Err(_) => connection_test(ConnectionTestState::Unavailable),
+        }
     }
 
     fn check_cooldown(&self) -> Result<()> {
@@ -227,6 +298,31 @@ impl CloudProvider {
             })?;
         self.handle_status(response.status(), response.headers())?;
         Ok(response)
+    }
+}
+
+fn connection_test(state: ConnectionTestState) -> ConnectionTest {
+    let message = match state {
+        ConnectionTestState::Connected => "Connected. The endpoint, model and key were accepted.",
+        ConnectionTestState::AuthenticationRequired => {
+            "Authentication was rejected. Check the API key."
+        }
+        ConnectionTestState::InvalidConfiguration => {
+            "The provider rejected this endpoint, API type or model. Check those settings."
+        }
+        ConnectionTestState::RateLimited => {
+            "The provider is rate limiting requests. Try again shortly."
+        }
+        ConnectionTestState::TimedOut => {
+            "The provider did not respond in time. Check the network and try again."
+        }
+        ConnectionTestState::Unavailable => {
+            "The provider could not be reached. Check the endpoint and network."
+        }
+    };
+    ConnectionTest {
+        state,
+        message: message.into(),
     }
 }
 
@@ -356,5 +452,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn connection_test_messages_are_safe_and_actionable() {
+        let cases = [
+            (ConnectionTestState::Connected, "accepted"),
+            (ConnectionTestState::AuthenticationRequired, "API key"),
+            (
+                ConnectionTestState::InvalidConfiguration,
+                "endpoint, API type or model",
+            ),
+            (ConnectionTestState::RateLimited, "rate limiting"),
+            (ConnectionTestState::TimedOut, "did not respond"),
+            (ConnectionTestState::Unavailable, "could not be reached"),
+        ];
+        for (state, expected) in cases {
+            let result = connection_test(state);
+            assert!(result.message.contains(expected));
+            assert!(!result.message.contains("fixture-not-a-real-key"));
+        }
     }
 }

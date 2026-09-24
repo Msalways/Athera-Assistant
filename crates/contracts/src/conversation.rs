@@ -119,6 +119,8 @@ pub struct ModelInstallation {
 /// Prompt content is data: providers must supply their own fixed system policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationRequest {
+    #[serde(default)]
+    pub personal: crate::PersonalContext,
     pub messages: Vec<Message>,
     pub summary: String,
     pub memories: Vec<PersonalMemory>,

@@ -10,7 +10,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 tokio.workspace = true
+
+[features]
+default = []
+tls-rustls = ["rig-core/rustls"]
+tls-native = ["rig-core/native-tls"]
 
 [lints]
 workspace = true

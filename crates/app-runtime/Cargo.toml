@@ -13,6 +13,7 @@ assistant-core.workspace = true
 storage-sqlite.workspace = true
 provider-cloud.workspace = true
 provider-needle.workspace = true
+provider-rig = { workspace = true, features = ["tls-rustls"] }
 provider-local-chat = { workspace = true, optional = true }
 adapter-mcp.workspace = true
 serde.workspace = true

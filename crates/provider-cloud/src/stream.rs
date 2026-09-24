@@ -174,6 +174,7 @@ mod tests {
             skills: vec![],
             candidates: vec![],
             tools: vec![],
+            adaptive_rules: vec![],
         }
     }
 

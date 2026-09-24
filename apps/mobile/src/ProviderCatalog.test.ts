@@ -1,4 +1,4 @@
-﻿import { expect, it } from "vitest";
+import { expect, it } from "vitest";
 import type { ProviderCatalogPayload, ProviderDefinition } from "./types";
 
 const fixture: ProviderCatalogPayload = {
@@ -57,6 +57,7 @@ const fixture: ProviderCatalogPayload = {
       ],
       availability: "available",
       documentation_url: "https://platform.openai.com/docs",
+      default_base_url: "https://api.openai.com/v1",
     },
     {
       schema: "aethra.provider-catalog.v1",
@@ -99,6 +100,7 @@ const fixture: ProviderCatalogPayload = {
       ],
       availability: "available",
       documentation_url: null,
+      default_base_url: null,
     },
   ],
 };

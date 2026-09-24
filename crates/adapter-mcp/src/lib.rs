@@ -14,7 +14,9 @@ use rmcp::{
     model::CallToolRequestParam,
     service::{ClientInitializeError, RunningService, ServiceError},
     transport::{
-        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
+        streamable_http_client::{
+            AuthRequiredError, StreamableHttpClientTransportConfig, StreamableHttpError,
+        },
         DynamicTransportError, StreamableHttpClientTransport,
     },
     RoleClient, ServiceExt,
@@ -121,6 +123,7 @@ where
 pub struct McpManager {
     clients: RwLock<BTreeMap<String, Arc<RunningService<RoleClient, ()>>>>,
     configs: RwLock<BTreeMap<String, ConnectionConfig>>,
+    auth_challenges: RwLock<BTreeMap<String, OAuthChallenge>>,
     credentials: Arc<dyn CredentialResolver>,
 }
 
@@ -134,6 +137,7 @@ impl McpManager {
         Self {
             clients: RwLock::new(BTreeMap::new()),
             configs: RwLock::new(BTreeMap::new()),
+            auth_challenges: RwLock::new(BTreeMap::new()),
             credentials,
         }
     }
@@ -164,8 +168,22 @@ impl McpManager {
             None => StreamableHttpClientTransportConfig::with_uri(config.url.clone()),
         };
         let transport = StreamableHttpClientTransport::with_client(client, transport_config);
-        let client = ().serve(transport).await.map_err(map_initialize_error)?;
-        let tools = client.list_all_tools().await.map_err(map_service_error)?;
+        let client = match ().serve(transport).await {
+            Ok(client) => client,
+            Err(error) => {
+                self.record_auth_challenge(&config.id, initialize_oauth_challenge(&error))
+                    .await;
+                return Err(map_initialize_error(error));
+            }
+        };
+        let tools = match client.list_all_tools().await {
+            Ok(tools) => tools,
+            Err(error) => {
+                self.record_auth_challenge(&config.id, service_oauth_challenge(&error))
+                    .await;
+                return Err(map_service_error(error));
+            }
+        };
         if tools.len() > 5000 {
             return Err(Error::InvalidResponse);
         }
@@ -222,11 +240,37 @@ impl McpManager {
             .write()
             .await
             .insert(config.id.clone(), Arc::new(client));
+        self.auth_challenges.write().await.remove(&config.id);
         Ok(specs)
     }
+
+    /// Returns and consumes the last valid OAuth challenge received for a connection.
+    pub async fn take_oauth_challenge(&self, connection_id: &str) -> Option<OAuthChallenge> {
+        self.auth_challenges.write().await.remove(connection_id)
+    }
+
+    /// Returns the last validated challenge without consuming the state needed by the UI.
+    pub async fn oauth_challenge(&self, connection_id: &str) -> Option<OAuthChallenge> {
+        self.auth_challenges
+            .read()
+            .await
+            .get(connection_id)
+            .cloned()
+    }
+
+    async fn record_auth_challenge(&self, connection_id: &str, challenge: Option<OAuthChallenge>) {
+        let mut challenges = self.auth_challenges.write().await;
+        if let Some(challenge) = challenge {
+            challenges.insert(connection_id.to_owned(), challenge);
+        } else {
+            challenges.remove(connection_id);
+        }
+    }
+
     pub async fn disconnect(&self, id: &str) {
         self.clients.write().await.remove(id);
         self.configs.write().await.remove(id);
+        self.auth_challenges.write().await.remove(id);
     }
 }
 #[async_trait]
@@ -268,17 +312,22 @@ impl ToolExecutor for McpManager {
                 name: spec.source_tool.clone().into(),
                 arguments: call.arguments.as_object().cloned(),
             })
-            .await
-            .map_err(|error| {
-                if service_requires_auth(&error) {
-                    return Error::AuthRequired;
-                }
-                if spec.risk.retry_safe() {
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.record_auth_challenge(&config.id, service_oauth_challenge(&error))
+                    .await;
+                return Err(if service_requires_auth(&error) {
+                    Error::AuthRequired
+                } else if spec.risk.retry_safe() {
                     Error::Unavailable
                 } else {
                     Error::OutcomeUnknown
-                }
-            })?;
+                });
+            }
+        };
+        self.auth_challenges.write().await.remove(&config.id);
         if result.is_error == Some(true) {
             return Err(Error::OutcomeUnknown);
         }
@@ -321,11 +370,55 @@ fn service_requires_auth(error: &ServiceError) -> bool {
     matches!(error, ServiceError::TransportSend(error) if transport_requires_auth(error))
 }
 
+fn initialize_oauth_challenge(error: &ClientInitializeError) -> Option<OAuthChallenge> {
+    match error {
+        ClientInitializeError::TransportError { error, .. } => transport_oauth_challenge(error),
+        _ => None,
+    }
+}
+
+fn service_oauth_challenge(error: &ServiceError) -> Option<OAuthChallenge> {
+    match error {
+        ServiceError::TransportSend(error) => transport_oauth_challenge(error),
+        _ => None,
+    }
+}
+
+fn transport_oauth_challenge(error: &DynamicTransportError) -> Option<OAuthChallenge> {
+    streamable_oauth_challenge(
+        error
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest::Error>>()?,
+    )
+}
+
+fn streamable_oauth_challenge(
+    error: &StreamableHttpError<reqwest::Error>,
+) -> Option<OAuthChallenge> {
+    let StreamableHttpError::AuthRequired(AuthRequiredError {
+        www_authenticate_header,
+    }) = error
+    else {
+        return None;
+    };
+    OAuthChallenge::parse(www_authenticate_header).ok()
+}
+
 fn transport_requires_auth(error: &DynamicTransportError) -> bool {
     error
         .error
         .downcast_ref::<StreamableHttpError<reqwest::Error>>()
-        .is_some_and(|error| matches!(error, StreamableHttpError::AuthRequired(_)))
+        .is_some_and(|error| match error {
+            StreamableHttpError::AuthRequired(_) => true,
+            // rmcp 0.8 only promotes 401 responses with WWW-Authenticate to
+            // AuthRequired. A protected MCP endpoint may instead return 403
+            // (notably for insufficient_scope), which reqwest preserves as a
+            // status on its client error after error_for_status().
+            StreamableHttpError::Client(error) => error
+                .status()
+                .is_some_and(|status| matches!(status.as_u16(), 401 | 403)),
+            _ => false,
+        })
 }
 
 fn normalize_web_result(
@@ -555,6 +648,8 @@ mod tests {
         assert_eq!(request.connection_id, "example");
         assert_eq!(request.origin, "https://mcp.example.com");
         assert_eq!(request.resource, endpoint.as_str());
+        assert_eq!(request.authorization_server, None);
+        assert!(request.requested_scopes.is_empty());
         let auth = bearer
             .resolve("example", &endpoint, &FixedCredentials("fixture-secret"))
             .unwrap();
@@ -614,6 +709,60 @@ mod tests {
             preset: None,
         };
         assert_eq!(manager.connect(&config).await, Err(Error::AuthRequired));
+    }
+
+    #[test]
+    fn transport_challenges_are_parsed_without_exposing_raw_headers() {
+        let error: StreamableHttpError<reqwest::Error> =
+            StreamableHttpError::AuthRequired(AuthRequiredError {
+                www_authenticate_header: "Bearer resource_metadata=\"https://mcp.example.com/meta\", scope=\"read\", error=\"insufficient_scope\"".into(),
+            });
+        let challenge = streamable_oauth_challenge(&error).unwrap();
+        assert_eq!(challenge.scopes, ["read"]);
+        assert!(challenge.insufficient_scope);
+
+        let malformed: StreamableHttpError<reqwest::Error> =
+            StreamableHttpError::AuthRequired(AuthRequiredError {
+                www_authenticate_header: "Basic realm=\"secret\"".into(),
+            });
+        assert_eq!(streamable_oauth_challenge(&malformed), None);
+    }
+
+    #[tokio::test]
+    async fn upstream_forbidden_is_auth_required_without_body_leakage() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nWWW-Authenticate: Bearer scope=\"files:write\", error=\"insufficient_scope\"\r\nContent-Length: 19\r\n\r\nsecret-token-body!",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/mcp"))
+            .send()
+            .await
+            .unwrap();
+        let error = response.error_for_status().unwrap_err();
+        let transport = DynamicTransportError {
+            transport_name: std::borrow::Cow::Borrowed("test"),
+            transport_type_id: std::any::TypeId::of::<()>(),
+            error: Box::new(StreamableHttpError::Client(error)),
+        };
+
+        assert!(transport_requires_auth(&transport));
+        assert!(!format!("{transport:?}").contains("secret-token-body"));
+        server.await.unwrap();
     }
 
     #[test]

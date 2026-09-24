@@ -104,6 +104,17 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../../migrations/009_task_blockers.sql"))
                 .map_err(|_| Error::Storage)?;
         }
+        if !tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=10)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(|_| Error::Storage)?
+        {
+            tx.execute_batch(include_str!("../../../migrations/010_jobs.sql"))
+                .map_err(|_| Error::Storage)?;
+        }
         tx.execute(
             "UPDATE messages SET status='interrupted' WHERE status='generating'",
             [],
@@ -585,6 +596,58 @@ impl Store for SqliteStore {
         )
         .map_err(|_| Error::Storage)?;
         Ok(())
+    }
+
+    fn save_job(&self, job: &DurableJob) -> Result<()> {
+        job.validate().map_err(|_| Error::InvalidInput)?;
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        conn.execute(
+            "INSERT INTO jobs(id, task_id, objective, success_condition, status, run_at, condition, allowed_tools, max_actions, actions_taken, created_at, updated_at, data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET task_id=excluded.task_id, objective=excluded.objective, success_condition=excluded.success_condition, status=excluded.status, run_at=excluded.run_at, condition=excluded.condition, allowed_tools=excluded.allowed_tools, max_actions=excluded.max_actions, actions_taken=excluded.actions_taken, updated_at=excluded.updated_at, data=excluded.data",
+            params![
+                job.id,
+                job.task_id,
+                job.objective,
+                job.success_condition,
+                encode(&job.status)?,
+                job.trigger.run_at.map(timestamp).transpose()?,
+                job.trigger.condition,
+                encode(&job.allowed_tools)?,
+                job.max_actions as i64,
+                job.actions_taken as i64,
+                timestamp(job.created_at)?,
+                timestamp(job.updated_at)?,
+                encode(job)?,
+            ],
+        )
+        .map_err(|_| Error::Storage)?;
+        Ok(())
+    }
+
+    fn job(&self, id: &str) -> Result<Option<DurableJob>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        let row = conn
+            .query_row("SELECT data FROM jobs WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|_| Error::Storage)?;
+        row.map(decode).transpose()
+    }
+
+    fn due_jobs(&self, now_millis: u64) -> Result<Vec<DurableJob>> {
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        let mut stmt = conn
+            .prepare("SELECT data FROM jobs WHERE status=?1 AND run_at IS NOT NULL AND run_at<=?2 ORDER BY run_at")
+            .map_err(|_| Error::Storage)?;
+        let rows = stmt
+            .query_map(
+                params![encode(&JobStatus::Scheduled)?, timestamp(now_millis)?],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| Error::Storage)?;
+        rows.map(|row| decode(row.map_err(|_| Error::Storage)?))
+            .collect()
     }
 
     fn save_task(&self, task: &Task) -> Result<()> {

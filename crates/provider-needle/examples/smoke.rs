@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
         results: vec![],
         skills: vec![],
         candidates: vec![],
+        adaptive_rules: vec![],
         tools: vec![ToolSpec {
             id: "native.set_flashlight".into(),
             version: "1".into(),

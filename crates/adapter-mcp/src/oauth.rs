@@ -9,11 +9,25 @@ use std::fmt;
 const TRANSACTION_TTL_SECONDS: u64 = 600;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OAuthChallenge {
     pub resource_metadata: Option<String>,
     pub scopes: Vec<String>,
     pub insufficient_scope: bool,
+}
+
+impl fmt::Debug for OAuthChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthChallenge")
+            .field(
+                "resource_metadata",
+                &self.resource_metadata.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("scopes", &self.scopes)
+            .field("insufficient_scope", &self.insufficient_scope)
+            .finish()
+    }
 }
 
 impl OAuthChallenge {
@@ -343,6 +357,11 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TokenErrorResponse {
+    error: String,
+}
+
 impl TokenResponse {
     fn into_tokens(self, now: u64, previous_refresh: Option<String>) -> Result<OAuthTokenSet> {
         if !self.token_type.eq_ignore_ascii_case("bearer") {
@@ -586,6 +605,12 @@ async fn read_token_response(
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
             return Err(Error::AuthRequired)
         }
+        reqwest::StatusCode::BAD_REQUEST => {
+            let bytes = read_bounded(response).await?;
+            let response: TokenErrorResponse =
+                serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)?;
+            return Err(map_token_error(&response.error));
+        }
         reqwest::StatusCode::TOO_MANY_REQUESTS => return Err(Error::RateLimited),
         status if !status.is_success() => return Err(Error::Unavailable),
         _ => {}
@@ -594,6 +619,17 @@ async fn read_token_response(
     let response: TokenResponse =
         serde_json::from_slice(&bytes).map_err(|_| Error::InvalidResponse)?;
     response.into_tokens(now, previous_refresh)
+}
+
+fn map_token_error(error: &str) -> Error {
+    match error {
+        "invalid_grant" | "invalid_token" => Error::AuthRequired,
+        "access_denied" | "invalid_client" | "invalid_scope" | "unauthorized_client" => {
+            Error::Denied
+        }
+        "temporarily_unavailable" => Error::Unavailable,
+        _ => Error::InvalidResponse,
+    }
 }
 
 async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>> {
@@ -833,6 +869,7 @@ mod tests {
         .unwrap();
         assert_eq!(challenge.scopes, ["files:read", "profile"]);
         assert!(challenge.insufficient_scope);
+        assert!(!format!("{challenge:?}").contains("mcp.example.com/meta"));
         assert_eq!(
             protected_resource_metadata_urls(&endpoint, Some(&challenge)).unwrap(),
             [Url::parse("https://mcp.example.com/meta").unwrap()]
@@ -1036,5 +1073,9 @@ mod tests {
             .into_tokens(0, None),
             Err(Error::InvalidResponse)
         ));
+        assert_eq!(map_token_error("invalid_grant"), Error::AuthRequired);
+        assert_eq!(map_token_error("invalid_token"), Error::AuthRequired);
+        assert_eq!(map_token_error("invalid_scope"), Error::Denied);
+        assert_eq!(map_token_error("unknown"), Error::InvalidResponse);
     }
 }

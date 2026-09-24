@@ -414,8 +414,30 @@ export interface ProviderDefinition {
   auth_options: AuthOptionSpec[];
   availability: CatalogProviderAvailability;
   documentation_url: string | null;
+  default_base_url: string | null;
 }
 export interface ProviderCatalogPayload {
   schema: "aethra.provider-catalog-registry.v1";
   providers: ProviderDefinition[];
+}
+export interface ProviderProfileDraft {
+  provider_id: string;
+  auth_option_id: string;
+  values: Record<string, string>;
+  secrets: Record<string, string>;
+}
+export interface ProviderProfile {
+  schema: "aethra.provider-profile.v1";
+  provider_id: string;
+  auth_option_id: string;
+  non_secret_config: Record<string, unknown>;
+  enabled: boolean;
+  display_name: string | null;
+  created_at: number;
+  updated_at: number;
+}
+export interface SavedProviderProfile {
+  profile: ProviderProfile;
+  key_configured: boolean;
+  active: boolean;
 }

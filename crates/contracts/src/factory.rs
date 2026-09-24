@@ -120,6 +120,18 @@ impl ProviderFactory {
     pub fn has_credential(&self, provider_id: &str) -> bool {
         self.vault.has(provider_id, CredentialPurpose::ProviderAuth)
     }
+
+    pub fn raw_secret(&self, provider_id: &str) -> Result<String, FactoryError> {
+        Ok(self
+            .vault
+            .get(provider_id, CredentialPurpose::ProviderAuth)
+            .map_err(|e| match e {
+                VaultError::NotFound => AuthError::NotFound,
+                VaultError::Locked => AuthError::VaultLocked,
+                _ => AuthError::NotFound,
+            })?
+            .ok_or(AuthError::NotFound)?)
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +178,7 @@ mod tests {
             }],
             availability: ProviderAvailability::Available,
             documentation_url: None,
+            default_base_url: None,
         }
     }
 
@@ -246,6 +259,19 @@ mod tests {
         let factory = setup_factory();
         assert!(factory.has_credential("nvidia-nim"));
         assert!(!factory.has_credential("nonexistent"));
+    }
+
+    #[test]
+    fn raw_secret_roundtrip() {
+        let factory = setup_factory();
+        assert_eq!(
+            factory.raw_secret("nvidia-nim"),
+            Ok("sk-nim-key-12345678".into())
+        );
+        assert!(matches!(
+            factory.raw_secret("nonexistent"),
+            Err(FactoryError::Auth(AuthError::NotFound))
+        ));
     }
 
     #[test]

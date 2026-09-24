@@ -147,6 +147,7 @@ mod tests {
             }],
             availability: ProviderAvailability::Available,
             documentation_url: None,
+            default_base_url: None,
         }
     }
 

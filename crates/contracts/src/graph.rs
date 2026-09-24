@@ -4,6 +4,96 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const WORK_GRAPH_SCHEMA_V1: &str = "aethra.work-graph.v1";
+pub const WORK_GRAPH_PROPOSAL_SCHEMA_V1: &str = "aethra.work-graph-proposal.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedWorkNode {
+    pub key: String,
+    pub objective: String,
+    pub operation: WorkerOperation,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    pub dependency_policy: DependencyPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkGraphProposal {
+    pub schema: String,
+    pub nodes: Vec<ProposedWorkNode>,
+}
+
+impl WorkGraphProposal {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != WORK_GRAPH_PROPOSAL_SCHEMA_V1
+            || self.nodes.is_empty()
+            || self.nodes.len() > 32
+        {
+            return Err(Error::InvalidInput);
+        }
+        let keys: BTreeSet<_> = self.nodes.iter().map(|node| node.key.as_str()).collect();
+        if keys.len() != self.nodes.len() {
+            return Err(Error::InvalidInput);
+        }
+        for node in &self.nodes {
+            if node.key.is_empty()
+                || node.key.len() > 64
+                || !node
+                    .key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                || node.objective.trim().is_empty()
+                || node.objective.len() > 2_000
+                || node.dependencies.len() > 32
+                || node
+                    .dependencies
+                    .iter()
+                    .any(|key| key == &node.key || !keys.contains(key.as_str()))
+                || node.dependencies.iter().collect::<BTreeSet<_>>().len()
+                    != node.dependencies.len()
+            {
+                return Err(Error::InvalidInput);
+            }
+            if let DependencyPolicy::AllowFailures { min_successes } = node.dependency_policy {
+                if min_successes > node.dependencies.len() {
+                    return Err(Error::InvalidInput);
+                }
+            }
+        }
+        let mut indegree: BTreeMap<&str, usize> = keys.iter().map(|key| (*key, 0)).collect();
+        let mut outgoing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for node in &self.nodes {
+            for dependency in &node.dependencies {
+                *indegree
+                    .get_mut(node.key.as_str())
+                    .ok_or(Error::InvalidInput)? += 1;
+                outgoing
+                    .entry(dependency.as_str())
+                    .or_default()
+                    .push(node.key.as_str());
+            }
+        }
+        let mut ready: Vec<_> = indegree
+            .iter()
+            .filter_map(|(key, count)| (*count == 0).then_some(*key))
+            .collect();
+        let mut visited = 0;
+        while let Some(key) = ready.pop() {
+            visited += 1;
+            for child in outgoing.get(key).into_iter().flatten() {
+                let count = indegree.get_mut(child).ok_or(Error::InvalidInput)?;
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(child);
+                }
+            }
+        }
+        (visited == self.nodes.len())
+            .then_some(())
+            .ok_or(Error::InvalidInput)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -205,6 +295,12 @@ impl WorkGraph {
             .iter()
             .map(|node| (node.id, node.state))
             .collect();
+        let active = self
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.state, WorkNodeState::Leased | WorkNodeState::Running))
+            .count();
+        let capacity = usize::from(self.max_parallel_workers).saturating_sub(active);
         Ok(self
             .nodes
             .iter()
@@ -229,7 +325,7 @@ impl WorkGraph {
                 }
             })
             .map(|node| node.id)
-            .take(self.max_parallel_workers.into())
+            .take(capacity)
             .collect())
     }
 
@@ -399,6 +495,7 @@ mod tests {
                 skills: vec![],
                 candidates: vec![],
                 tools: vec![tool],
+                adaptive_rules: vec![],
             },
         }
     }
@@ -445,6 +542,42 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn proposal() -> WorkGraphProposal {
+        WorkGraphProposal {
+            schema: WORK_GRAPH_PROPOSAL_SCHEMA_V1.into(),
+            nodes: vec![
+                ProposedWorkNode {
+                    key: "first".into(),
+                    objective: "Read the first source".into(),
+                    operation: WorkerOperation::Infer,
+                    dependencies: vec![],
+                    dependency_policy: DependencyPolicy::AllSucceeded,
+                },
+                ProposedWorkNode {
+                    key: "join".into(),
+                    objective: "Join the evidence".into(),
+                    operation: WorkerOperation::Infer,
+                    dependencies: vec!["first".into()],
+                    dependency_policy: DependencyPolicy::AllSucceeded,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validates_bounded_graph_proposals() {
+        assert_eq!(proposal().validate(), Ok(()));
+        let mut duplicate = proposal();
+        duplicate.nodes[1].key = "first".into();
+        assert_eq!(duplicate.validate(), Err(Error::InvalidInput));
+        let mut unknown = proposal();
+        unknown.nodes[1].dependencies = vec!["missing".into()];
+        assert_eq!(unknown.validate(), Err(Error::InvalidInput));
+        let mut cyclic = proposal();
+        cyclic.nodes[0].dependencies = vec!["join".into()];
+        assert_eq!(cyclic.validate(), Err(Error::InvalidInput));
     }
 
     #[test]
@@ -545,5 +678,14 @@ mod tests {
         assert_eq!(graph.nodes[0].state, WorkNodeState::Failed);
         graph.cancel_remaining();
         assert_eq!(graph.nodes[2].state, WorkNodeState::Cancelled);
+    }
+
+    #[test]
+    fn active_workers_consume_parallel_capacity() {
+        let mut graph = graph();
+        graph.nodes[0].state = WorkNodeState::Running;
+        assert_eq!(graph.ready_nodes(2).unwrap(), vec![graph.nodes[1].id]);
+        graph.nodes[1].state = WorkNodeState::Leased;
+        assert!(graph.ready_nodes(2).unwrap().is_empty());
     }
 }

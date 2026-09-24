@@ -81,6 +81,17 @@ The page uses the `aethra.run-events.v1` schema; pass its `next_after` value on 
 poll. The existing `events` command returns the same envelopes as a compatibility
 surface.
 
+## Governed adaptive rules
+
+Adaptive behavior is persisted as versioned `aethra.adaptive-rule.v1` records. A
+model can submit an `assistant_control` `propose_rule` action, but Rust validates
+and stores it as `proposed`; it cannot enable the rule or change tools,
+permissions, policy, or secrets. The Settings → Adaptive Rules screen is the
+explicit review gate. Only enabled, non-expired rules matching the current
+conversation/workflow are retrieved (maximum eight) and sent to providers as
+user-approved preferences. Rules can be rejected, disabled, superseded, and
+audited through their evidence IDs and version history.
+
 Completed text is normalized to an `aethra.output.v1` Markdown block. Scripted or
 future provider adapters may return `respond_structured` with bounded Markdown, list
 and table blocks. Web runs can also add a validated sources block with source IDs,
@@ -109,8 +120,10 @@ forward an existing session key to a different server.
 The advanced credential-reference field still accepts an environment variable
 name (for example `ASSISTANT_CLOUD_KEY`), never a key value. The environment is
 the fallback when no matching session key exists. Environment changes require
-restarting the backend. Native OS-backed persistent credential storage remains
-unimplemented; session storage is not a substitute for Android Keystore.
+restarting the backend. Native host credential persistence remains intentionally
+session-only. Android connects OAuth token records to an AES-GCM Keystore plugin
+boundary using opaque handles and binding metadata as associated data; tokens are
+never stored in SQLite or returned to React.
 
 The snapshot's `cloud_session_key` is a boolean and `cloud_credential` reports only
 `not_configured`, `missing`, or `configured`, not successful remote authentication.
@@ -152,9 +165,12 @@ Use `connect_mcp` with an HTTPS MCP URL. Discovered tools are disabled by defaul
 MCP connections use the versioned `aethra.mcp-connection.v1` manifest. VS02 supports
 anonymous Streamable HTTP. The VS03 foundation also accepts tagged `bearer_token`,
 `api_key_header`, and `oauth_authorization_code` profiles. Static credential values
-are resolved from endpoint-bound session storage and never serialized; OAuth browser
-authorization and Android Keystore persistence remain pending. Additional transports
-also remain pending. `connect_parallel_search {}` installs the reviewed anonymous preset for
+are resolved from endpoint-bound session storage and never serialized. The host OAuth
+flow is implemented, and Android launches authorization in a Custom Tab, captures
+only an exact HTTPS App Link callback, and restores bound token records through the
+Keystore boundary. Production callback-domain verification and additional transports
+remain pending.
+`connect_parallel_search {}` installs the reviewed anonymous preset for
 `https://search.parallel.ai/mcp`, discovers only `web_search` and `web_fetch`, and
 normalizes them to `web.search` and `web.open`. The tools remain disabled until the
 user enables them in Settings.
@@ -162,9 +178,11 @@ user enables them in Settings.
 For a static credential, call `connect_mcp_with_credential` with a `connection`
 manifest and separate `secret`. The mobile connection form does this for Bearer and
 the reviewed `x-api-key` header. `save_mcp_credential` and `clear_mcp_credential`
-change session-only values; `mcp_connection_status` returns only `configured`,
-`missing`, or `not_required`. The adapter resolves the exact connection/origin/resource
-binding before network I/O and does not follow HTTP redirects.
+change session-only values. `mcp_connection_status` returns a redacted
+`aethra.connection-state.v1` value with connection state, requested/granted scope
+names, expiry and resumable-task metadata, but no credential values. The adapter
+resolves the exact connection/origin/resource binding before network I/O and does
+not follow HTTP redirects.
 
 Web tool calls persist an `aethra.tool-result.v1` record. Its `raw` field retains the
 bounded MCP response for audit, while only the separately bounded `model_context`
@@ -184,6 +202,16 @@ The dated 2026-09-14 result is in
 `artifacts/evals/vs02-parallel-live-2026-09-14.json`. It proves live MCP discovery,
 execution and source normalization, not cloud-model answer quality.
 
+Android release builds require the verified App Link host and callback path to be
+provided as Gradle properties; the placeholder host is rejected for release:
+
+```powershell
+.\gradlew.bat assembleRelease -PoauthRedirectHost=assistant.example.com -PoauthRedirectPath=/oauth/callback
+```
+
+The corresponding `https://assistant.example.com/oauth/callback` association must be
+published in `assetlinks.json` before device acceptance.
+
 Run the OAuth metadata-only smoke without starting authorization:
 
 ```powershell
@@ -202,17 +230,24 @@ consent, token exchange, authenticated MCP calls, refresh, or Android storage.
 `submit_input`, `run_task`, `cancel_task`, `resume_auth`, `resolve_approval`, `answer_question`, `save_settings`, `save_cloud_provider`, `clear_cloud_key`, `save_capability`, `save_mcp_connection`, `connect_mcp`, `connect_mcp_with_credential`, `save_mcp_credential`, `clear_mcp_credential`, `mcp_connection_status`, `start_mcp_oauth`, `complete_mcp_oauth`, `cancel_mcp_oauth`, `connect_parallel_search`, `disconnect_mcp`, `snapshot`, `events`, and `run_events` are the runtime command names. Input can be marked `source: "voice"` today; speech capture and wake-word services are deferred behind this boundary.
 
 `WorkGraph`, `WorkNode`, `WorkEdge`, `WorkerRequest`, and `WorkerOutcome` are the
-VS04 persistence boundary. Worker packets are capped at 64 KiB and eight selected
-tools. Graph workers accept inference or enabled read-only tools; mutations remain in
-the existing serialized `Assistant`/`PolicyEngine` path. Graph state is additive in
-the task JSON and older task records deserialize with no graph.
+VS04 persistence boundary. Models may emit only a bounded `WorkGraphProposal`; Rust
+validates it and assigns task/node/worker IDs, deadlines, retry limits and
+idempotency keys. Worker packets are capped at 64 KiB and eight selected tools. The
+scheduler runs at most two ready workers concurrently, revalidates enabled read-only
+tools immediately before execution, persists every transition and joins results in
+stable graph order. Mutations remain in the serialized `Assistant`/`PolicyEngine`
+path. Cancellation aborts active work and cancels descendants; safe unfinished
+nodes are recovered at runtime startup, including graphs beyond the UI task-page
+limit. Unsafe, expired, cancelled, approval-paused and write-capable work is left
+for explicit resolution rather than replayed.
 
 ## Acceptance evidence
 
 Host evidence is recorded by `cargo test --workspace` and `npm test`. Anonymous
-Parallel Search MCP was verified live on 2026-09-14. Physical Android, OAuth,
-authenticated MCP, cloud-model synthesis, and signed APK evidence must be appended
-here with device/version and timestamp before those tasks are marked done.
+Parallel Search MCP was verified live on 2026-09-14. Deterministic graph evidence is
+in `evals/fixtures/parallel-workers.jsonl`. Physical Android, OAuth, authenticated
+MCP, cloud-model synthesis, and signed APK evidence must be appended here with
+device/version and timestamp before those tasks are marked done.
 
 ## Offline companion commands
 
@@ -276,3 +311,27 @@ in-process adapter, add `--features native-local-chat` and configure the shim li
 `evals/companion-v1.jsonl` is the 60-scenario acceptance catalog. `evals/README.md`
 distinguishes deterministic regressions from model-quality measurements. Android
 preflight and physical-device instructions are in `ANDROID_FEASIBILITY.md`.
+
+## Governed personalization
+
+Personalization is application-owned state, not a model prompt cache. `adaptive_rules`
+holds the current rule, while immutable `personal_revisions` records every proposal,
+review, disable, replacement and rollback. Rules are retrieved before inference with
+scope, expiry, priority and size limits; temporary conversations receive neither
+rules nor personal memories. Exact rule revisions used by a response/action are
+recorded in `personal_usage`.
+
+The runtime exposes `remember_preference`, `record_observation`,
+`list_adaptive_rules`, `list_rule_proposals`, `review_rule_proposal`,
+`disable_adaptive_rule`, `personal_rule_details`, `personal_rule_history`,
+`rollback_adaptive_rule`, `propose_skill`, and `evaluate_personal_skill`.
+Explicit remembered preferences require confirmation and can activate immediately.
+Inferred preferences and model suggestions remain proposals until reviewed. A deleted
+conversation removes derived observations and preferences.
+
+Generated skills are declarative capability contracts, never executable scripts.
+They stay inactive until replay evaluation compares the candidate against the
+baseline using recorded/simulated tool data. Activation also rechecks each captured
+tool binding; a changed or disabled dependency automatically disables the skill.
+Rules and generated skills cannot grant permissions, enable a disabled tool, or
+override `PolicyEngine` approval requirements.

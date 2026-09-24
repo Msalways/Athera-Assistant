@@ -462,16 +462,106 @@ recorded here.
 
 ### Pending dev work (owner: agent, not blocked on user)
 
-- Replace the scaffold-only `provider-rig` path with real Rig clients and make
-  the production runtime use that factory.
-- Correct provider-specific auth headers and implement genuine composite
-  credentials before any provider is called supported.
+Completed since the 2026-09-23 audit (all GNU-toolchain verified):
+- Real Rig clients behind the adapter boundary (`provider-rig/src/client.rs`):
+  OpenAI-completions request/response mapping, tool-call mapping, error
+  normalization with Retry-After; NVIDIA NIM works through the identical path
+  via base-URL override.
+- Provider-specific wire headers from Rig 0.42.0 source (Bearer for
+  OpenAI-shaped, `x-api-key` + `anthropic-version` for Anthropic,
+  `x-goog-api-key` for Gemini, `api-key` for Azure) carried on
+  `AuthOptionSpec`; Bedrock exposes both SigV4 and bearer-key options.
+- Genuine composite credentials: JSON-blob vault entry with per-key
+  extraction; partial sets, non-object blobs and non-string values rejected.
+- Full 26/26 Rig-core catalog coverage in `default_catalog` (30 entries with
+  local profiles); OAuth/local/embeddings-only stubs honestly marked
+  `DisabledByFeature`.
+- Deterministic greeting helper (`local_response.rs`); engine submit-path
+  wiring deferred (see toolchain note).
+- UAT-b settings replacement: `ProviderCatalogSettings` renders endpoint/auth
+  fields from the Rust catalog; `save/list/delete_provider_profile` commands
+  persist non-secret profiles to SQLite and hold secrets session-side with
+  echo protection; saved list shows set/unset key state.
+- UAT-c connection test: `test_provider_connection` loads the saved profile +
+  catalog descriptor, retrieves the session secret, and runs a live `hi` probe
+  through the real Rig OpenAI-completions client; outcomes return as typed
+  `ConnectionTestResult` (credential/endpoint/model/quota/network/provider)
+  and render per-profile in Settings.
+- Rig runtime selection (exit criterion a): `RigCloudProvider` implements the
+  neutral `ModelProvider` contract (protocol packet/tools in, `decode_call`
+  actions out, Rig errors mapped to engine errors); `assemble` prefers the
+  first enabled catalog profile with a session key and falls back to the
+  legacy provider otherwise; save/delete profile refreshes the assistant so
+  new tasks use the current provider while in-flight tasks finish on the old
+  one. Fixture-only environments behave exactly as before (no profiles).
+- PVD-011 failover matrix (`failover.rs`): validated policy chains; fallback
+  compatibility requires catalog presence, availability, same transport
+  family, a shared non-None auth kind, and no local-only widening.
+- Phase 2 job ledger contracts (`jobs.rs`): schedule/cancel/action-budget/
+  due transitions with terminal guards. Persistence layer done: migration 010
+  (`jobs` table + status/run_at index), `save_job`/`job`/`due_jobs` on the
+  `Store` trait with `SqliteStore` implementation and persistence tests
+  (compile-verified; execution awaits gcc).
+- Phase 2 policy core (`policy.rs`): `AutonomyEnvelope` (objective, allowed
+  tools/scopes, action budget, cost tier, approval mode, stop conditions)
+  with a deterministic `decide` function (allow / require-approval /
+  deny + tool-scope and budget enforcement). Engine integration remains open.
+- MEM-003 preference proposals (`preferences.rs`): repeated Correction/Remember
+  observations with matching text propose a reviewable rule with evidence IDs;
+  single observations, other kinds, and empty text propose nothing.
+- Anthropic-compatible profile: custom endpoint + API version fields with
+  key/bearer/custom-header auth and the standard version extra header.
+- Rig streaming (`client.rs` + `RigCloudProvider::infer_stream`): text/tool/
+  usage/end delta mapping with per-call index tracking and tool-fragment
+  merging; reasoning/unknown frames skipped.
+- TLS decision: `provider-rig` ships Rig's blessed `rustls` backend (aws-lc).
+  rig-core 0.42 offers no ring option; native-tls would break the Android
+  build (no system OpenSSL). cmake + NDK clang are present for the
+  device build; the first APK build with provider-rig arbitrates aws-lc.
+- Toolchain closure (2026-09-24): system GCC 16.2.0 found at
+  `C:\msys64\mingw64\bin` (MSYS2). Full workspace suite now executes on the
+  GNU toolchain: 336 Rust tests green, workspace clippy clean. The TLS
+  temp-swap procedure is retired; `tls-rustls` (incl. aws-lc) builds and
+  links. Remaining device-only gates: physical flows, live provider calls,
+  Keystore across restart/update, APK proof.
+- Catalog shape hardening: every chat definition carries a required `model`
+  endpoint field (Azure keeps deployment-as-model via `resolve_model`);
+  `default_base_url` on definitions with stable endpoints; shared
+  `normalize_endpoint` (trim, trailing-slash strip, http(s) only, no
+  credentials/query/fragment) and `resolve_model` used by save validation,
+  runtime selection and connection test alike; UI prefills the editable
+  base URL from the catalog default while keeping it overridable.
+- Single transport construction site (`provider-rig/src/transport.rs`):
+  `build_transport` resolves descriptor + option + config + secret into a
+  `ProviderTransport` enum (OpenAi / Anthropic / Gemini / Azure); native Rig
+  clients per family (Anthropic wire with version header, Gemini native wire,
+  Azure deployment URL rules); inference, streaming and connection test all
+  route through `complete_transport` / `stream_transport`. No-auth profiles
+  (Ollama) test and infer without secrets.
+- Streaming fragment accumulation: deltas concatenate per call id (empty ids
+  merge into the trailing open call), arguments parse once at finalize, and
+  malformed arguments fail loudly as `InvalidResponse` instead of silent Null.
+- Active-profile selection: `set_active_provider` persists the choice;
+  runtime prefers it and falls back to first-enabled; Settings shows the
+  Active badge with per-profile use-for-inference buttons.
+- Android Keystore for catalog provider keys (`android.rs` + `Runtime::
+  restore_provider_key`): save/delete arms mirror the legacy cloud-key flow
+  with `provider-key:{id}` handles bound to provider|auth-option; all stored
+  keys restore into session scope at startup.
+- Gradle packaging fix: `syncFrontendAssets` now orders before `preBuild`
+  instead of naming only the asset-merge task, covering lint-model and
+  future consumers of the synced assets directory.
+
+Still open (device or user input required):
 - Wire deterministic requirements/routing into the single submit path and let
-  Needle produce a normal local response or a typed handoff.
-- Replace the legacy hard-coded Action-model settings with the Rust catalog and
-  conditional auth renderer.
-- Add Android durable jobs, typed capability bridges and first-product tools.
-- Restore a native linker/C toolchain and run the full Rust workspace suite.
+  Needle produce a normal local response or a typed handoff (helper and
+  router are ready; engine suites now executable — schedule behind a
+  product-shape review since it changes greeting behavior).
+- Bridge the persisted job ledger to Android
+  WorkManager/notifications; add typed capability bridges and first-product
+  tools.
+- Full Rust workspace suite is green on the GNU toolchain (gcc 16.2.0);
+  rerun on CI/device pipeline as usual.
 
 ## 9. Verified implementation status (2026-09-23)
 

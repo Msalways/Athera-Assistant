@@ -4,7 +4,24 @@ import { Configuration } from "./Configuration";
 import { command } from "./service";
 import type { Snapshot } from "./types";
 
-vi.mock("./service", () => ({ command: vi.fn() }));
+vi.mock("./service", () => ({
+  command: vi.fn(),
+  getProviderCatalog: vi.fn(),
+  saveProviderProfile: vi.fn(),
+  listProviderProfiles: vi.fn(),
+  deleteProviderProfile: vi.fn(),
+  setActiveProvider: vi.fn(),
+  testProviderConnection: vi.fn(),
+  getBuildInfo: vi.fn(),
+}));
+import {
+  deleteProviderProfile,
+  getProviderCatalog,
+  listProviderProfiles,
+  saveProviderProfile,
+  setActiveProvider,
+  testProviderConnection,
+} from "./service";
 vi.mocked(command).mockResolvedValue({
   availability: "unavailable",
   installation: null,
@@ -18,6 +35,7 @@ const snapshot: Snapshot = {
   voice: "deferred",
   cloud_credential: "missing",
   cloud_session_key: false,
+  connections: [],
   settings: {
     cloud: {
       id: "test",
@@ -40,53 +58,192 @@ const snapshot: Snapshot = {
   },
 };
 
-it("sends a masked key through its dedicated command and clears it after success", async () => {
+const catalog = {
+  schema: "aethra.provider-catalog-registry.v1",
+  providers: [
+    {
+      schema: "aethra.provider-catalog.v1",
+      id: "openai",
+      display_name: "OpenAI",
+      transport_family: "open_ai_compatible",
+      capabilities: {
+        streaming: true,
+        tool_calls: true,
+        vision: true,
+        max_context_tokens: 128000,
+      },
+      endpoint_fields: [],
+      model_source: "catalog",
+      auth_options: [
+        {
+          id: "api_key",
+          label: "API Key",
+          auth_kind: "api_key",
+          fields: [
+            {
+              id: "api_key",
+              label: "API Key",
+              kind: "secret",
+              required: true,
+              secret: true,
+              validation: null,
+              options: [],
+              visible_when: [],
+              help_text: null,
+            },
+          ],
+          expiry_behavior: "never_expires",
+          refresh_behavior: "not_refreshable",
+          android_support: "fully_supported",
+          wire_header: "authorization",
+          wire_prefix: "Bearer ",
+          extra_headers: [],
+        },
+      ],
+      availability: "available",
+      documentation_url: null,
+      default_base_url: "https://api.openai.com/v1",
+    },
+  ],
+};
+
+function mockCatalog() {
+  vi.mocked(getProviderCatalog).mockResolvedValue(catalog as never);
+  vi.mocked(listProviderProfiles).mockResolvedValue([]);
+}
+
+it("renders catalog providers and saves a masked key through the profile command", async () => {
+  mockCatalog();
   const act = vi.fn().mockResolvedValue(true);
   render(<Configuration snapshot={snapshot} view="settings" act={act} />);
-  const field = screen.getByLabelText("API key (until backend restart)");
+  const field = await screen.findByLabelText("API Key");
   expect(field).toHaveAttribute("type", "password");
   fireEvent.change(field, { target: { value: "fixture-not-real-key" } });
   fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
-  await waitFor(() => expect(field).toHaveValue(""));
-  expect(act).toHaveBeenCalledWith("save_cloud_provider", {
-    cloud: snapshot.settings.cloud,
-    api_key: "fixture-not-real-key",
-  });
-  expect(act).not.toHaveBeenCalledWith("save_settings", expect.anything());
+  await waitFor(() =>
+    expect(saveProviderProfile).toHaveBeenCalledWith({
+      provider_id: "openai",
+      auth_option_id: "api_key",
+      values: {},
+      secrets: { api_key: "fixture-not-real-key" },
+    }),
+  );
+  expect(await screen.findByText("Provider saved.")).toBeVisible();
 });
 
-it("keeps an unsaved key when the backend rejects configuration", async () => {
-  const act = vi.fn().mockResolvedValue(false);
-  render(<Configuration snapshot={snapshot} view="settings" act={act} />);
-  const field = screen.getByLabelText("API key (until backend restart)");
+it("keeps the entered key when the backend rejects the profile", async () => {
+  mockCatalog();
+  vi.mocked(saveProviderProfile).mockRejectedValue(new Error("rejected"));
+  render(
+    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
+  );
+  const field = await screen.findByLabelText("API Key");
   fireEvent.change(field, { target: { value: "fixture-not-real-key" } });
   fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
-  await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Save provider" }),
-    ).not.toBeDisabled(),
-  );
+  expect(await screen.findByRole("alert")).toBeVisible();
   expect(field).toHaveValue("fixture-not-real-key");
 });
 
-it("can clear a backend session key without revealing it", async () => {
-  const act = vi.fn().mockResolvedValue(true);
+it("lists saved profiles with key state and removes them", async () => {
+  mockCatalog();
+  vi.mocked(listProviderProfiles).mockResolvedValue([
+    {
+      profile: {
+        schema: "aethra.provider-profile.v1",
+        provider_id: "openai",
+        auth_option_id: "api_key",
+        non_secret_config: {},
+        enabled: true,
+        display_name: "OpenAI",
+        created_at: 1,
+        updated_at: 1,
+      },
+      key_configured: true,
+      active: true,
+    },
+  ]);
   render(
-    <Configuration
-      snapshot={{
-        ...snapshot,
-        cloud_session_key: true,
-        cloud_credential: "configured",
-      }}
-      view="settings"
-      act={act}
-    />,
+    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
   );
-  expect(screen.getByLabelText("API key (until backend restart)")).toHaveValue(
-    "",
+  expect(await screen.findByText("Key stored")).toBeVisible();
+  expect(screen.getByText("Active")).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Remove OpenAI" }));
+  await waitFor(() =>
+    expect(deleteProviderProfile).toHaveBeenCalledWith("openai"),
   );
-  fireEvent.click(screen.getByRole("button", { name: "Clear session key" }));
-  await waitFor(() => expect(act).toHaveBeenCalledWith("clear_cloud_key", {}));
+});
+
+it("tests a saved profile connection and shows the typed outcome", async () => {
+  mockCatalog();
+  vi.mocked(listProviderProfiles).mockResolvedValue([
+    {
+      profile: {
+        schema: "aethra.provider-profile.v1",
+        provider_id: "openai",
+        auth_option_id: "api_key",
+        non_secret_config: {},
+        enabled: true,
+        display_name: "OpenAI",
+        created_at: 1,
+        updated_at: 1,
+      },
+      key_configured: true,
+      active: false,
+    },
+  ]);
+  vi.mocked(testProviderConnection).mockResolvedValue({
+    success: false,
+    failure_kind: "credential",
+    model_id: null,
+    latency_ms: null,
+    message: "Authentication was rejected. Check the API key.",
+  });
+  render(
+    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
+  );
+  expect(await screen.findByText("Key stored")).toBeVisible();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Test OpenAI connection" }),
+  );
+  await waitFor(() =>
+    expect(testProviderConnection).toHaveBeenCalledWith("openai"),
+  );
+  expect(
+    await screen.findByText("Authentication was rejected. Check the API key."),
+  ).toBeVisible();
+});
+
+it("marks a profile active for inference", async () => {
+  mockCatalog();
+  vi.mocked(listProviderProfiles).mockResolvedValue([
+    {
+      profile: {
+        schema: "aethra.provider-profile.v1",
+        provider_id: "openai",
+        auth_option_id: "api_key",
+        non_secret_config: {},
+        enabled: true,
+        display_name: "OpenAI",
+        created_at: 1,
+        updated_at: 1,
+      },
+      key_configured: true,
+      active: false,
+    },
+  ]);
+  render(
+    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
+  );
+  expect(await screen.findByText("Key stored")).toBeVisible();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Use OpenAI for inference" }),
+  );
+  await waitFor(() =>
+    expect(setActiveProvider).toHaveBeenCalledWith("openai"),
+  );
+  expect(
+    await screen.findByText("Active provider updated."),
+  ).toBeVisible();
 });
 
 it("connects the reviewed anonymous Parallel Search preset", async () => {
@@ -136,7 +293,7 @@ it("passes a bearer credential through the dedicated session-only command", asyn
 
 it("starts generic OAuth discovery without putting a token in settings", async () => {
   vi.mocked(command).mockImplementation(async (name) => {
-    if (name === "start_mcp_oauth")
+    if (name === "authorize_connection")
       return {
         transaction_id: "transaction",
         connection_id: "connection",
@@ -183,7 +340,7 @@ it("starts generic OAuth discovery without putting a token in settings", async (
       }),
     ),
   );
-  expect(command).toHaveBeenCalledWith("start_mcp_oauth", {
+  expect(command).toHaveBeenCalledWith("authorize_connection", {
     connection_id: expect.any(String),
     client_id: "public-client",
     client_metadata_url: null,
@@ -194,6 +351,48 @@ it("starts generic OAuth discovery without putting a token in settings", async (
     await screen.findByRole("link", { name: "Open secure sign-in" }),
   ).toHaveAttribute("href", "https://auth.example.com/authorize?state=opaque");
   expect(screen.queryByLabelText("Credential")).not.toBeInTheDocument();
+});
+
+it("completes native authorization without exposing a provider URL", async () => {
+  vi.mocked(command).mockImplementation(async (name) => {
+    if (name === "authorize_connection")
+      return {
+        transaction_id: "transaction",
+        connection_id: "connection",
+        expires_at: 123,
+        requested_scopes: ["read"],
+        resume_task_id: null,
+      };
+    if (name === "poll_authorization") return { state: "connected" };
+    return { availability: "unavailable", installation: null, manifest: null };
+  });
+  const act = vi.fn().mockResolvedValue(true);
+  render(<Configuration snapshot={snapshot} view="connections" act={act} />);
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "OAuth MCP" },
+  });
+  fireEvent.change(screen.getByLabelText("Authentication"), {
+    target: { value: "oauth_authorization_code" },
+  });
+  fireEvent.change(screen.getByLabelText("Server URL"), {
+    target: { value: "https://mcp.example.com/api" },
+  });
+  fireEvent.change(screen.getByLabelText("Authorization server issuer"), {
+    target: { value: "https://auth.example.com" },
+  });
+  fireEvent.change(screen.getByLabelText("Redirect URI"), {
+    target: { value: "https://app.example.com/oauth/callback" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  expect(
+    await screen.findByText("Connected. Resuming your task."),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("link", { name: "Open secure sign-in" }),
+  ).not.toBeInTheDocument();
+  expect(command).toHaveBeenCalledWith("poll_authorization", {
+    transaction_id: "transaction",
+  });
 });
 
 it("requires explicit confirmation in the memory command", async () => {

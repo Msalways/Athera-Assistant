@@ -61,6 +61,9 @@ pub fn validate_call(tool: &ToolSpec, call: &ToolCall) -> Result<()> {
 }
 
 pub fn activate(store: &dyn Store, id: &str) -> Result<SkillSpec> {
+    if id.starts_with("personal:") {
+        return super::personalization::PersonalizationService::new(store).skill(id);
+    }
     let Capability::Skill(skill) = store.capability(id)? else {
         return Err(Error::InvalidInput);
     };

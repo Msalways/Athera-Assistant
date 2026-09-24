@@ -18,10 +18,16 @@ struct McpCredential {
     value: String,
 }
 
+struct ProviderKey {
+    auth_option_id: String,
+    value: String,
+}
+
 #[derive(Default)]
 pub(crate) struct SessionSecrets {
     cloud: Mutex<Option<CloudCredential>>,
     mcp: Mutex<BTreeMap<String, McpCredential>>,
+    provider_keys: Mutex<BTreeMap<String, ProviderKey>>,
 }
 
 impl SessionSecrets {
@@ -97,11 +103,66 @@ impl SessionSecrets {
         })
     }
 
+    pub fn set_provider_key(
+        &self,
+        provider_id: &str,
+        auth_option_id: &str,
+        value: String,
+    ) -> Result<()> {
+        Self::validate(&value)?;
+        if provider_id.is_empty() || auth_option_id.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        self.provider_keys
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .insert(
+                provider_id.to_owned(),
+                ProviderKey {
+                    auth_option_id: auth_option_id.to_owned(),
+                    value,
+                },
+            );
+        Ok(())
+    }
+
+    pub fn clear_provider_key(&self, provider_id: &str) -> Result<()> {
+        self.provider_keys
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .remove(provider_id);
+        Ok(())
+    }
+
+    pub fn has_provider_key(&self, provider_id: &str, auth_option_id: &str) -> bool {
+        self.provider_keys.lock().is_ok_and(|keys| {
+            keys.get(provider_id)
+                .is_some_and(|key| key.auth_option_id == auth_option_id)
+        })
+    }
+
+    pub fn provider_secret(&self, provider_id: &str, auth_option_id: &str) -> Result<String> {
+        self.provider_keys
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .get(provider_id)
+            .filter(|key| key.auth_option_id == auth_option_id)
+            .map(|key| key.value.clone())
+            .ok_or(Error::AuthRequired)
+    }
+
     pub fn payload_contains_secret(&self, payload: &serde_json::Value) -> bool {
-        self.mcp.lock().is_ok_and(|credentials| {
+        self.cloud.lock().is_ok_and(|cloud| {
+            cloud
+                .as_ref()
+                .is_some_and(|credential| contains_secret(payload, &credential.value))
+        }) || self.mcp.lock().is_ok_and(|credentials| {
             credentials
                 .values()
                 .any(|credential| contains_secret(payload, &credential.value))
+        }) || self.provider_keys.lock().is_ok_and(|keys| {
+            keys.values()
+                .any(|key| contains_secret(payload, &key.value))
         })
     }
 }
@@ -151,9 +212,9 @@ fn contains_secret(value: &serde_json::Value, secret: &str) -> bool {
         serde_json::Value::Array(values) => {
             values.iter().any(|value| contains_secret(value, secret))
         }
-        serde_json::Value::Object(values) => {
-            values.values().any(|value| contains_secret(value, secret))
-        }
+        serde_json::Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains(secret) || contains_secret(value, secret)),
         _ => false,
     }
 }

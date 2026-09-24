@@ -1,8 +1,6 @@
-import java.io.File
 import org.apache.tools.ant.taskdefs.condition.Os
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
-import org.gradle.api.logging.LogLevel
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.TaskAction
 
@@ -44,30 +42,17 @@ open class BuildTask : DefaultTask() {
         }
     }
 
-    fun runTauriCli(executable: String) {
-        // Rust and frontend assets are prepared by scripts/build-sms-apk.ps1;
-        // this generated hook targets an obsolete Tauri CLI subcommand.
-        return
-        /*
-        val rootDirRel = rootDirRel ?: throw GradleException("rootDirRel cannot be null")
-        val target = target ?: throw GradleException("target cannot be null")
-        val release = release ?: throw GradleException("release cannot be null")
-        // Workspace-local node shim executes the Tauri CLI entrypoint named `tauri`.
-        val args = listOf("android-studio-script");
-
-        project.exec {
-            workingDir(File(project.projectDir, rootDirRel))
-            executable(executable)
-            args(args)
-            if (project.logger.isEnabled(LogLevel.DEBUG)) {
-                args("-vv")
-            } else if (project.logger.isEnabled(LogLevel.INFO)) {
-                args("-v")
-            }
-            if (release) {
-                args("--release")
-            }
-            args(listOf("--target", target))
-        }.assertNormalExitValue()*/
+    fun runTauriCli(@Suppress("UNUSED_PARAMETER") executable: String) {
+        // Tauri's current Android CLI builds the web bundle but does not sync
+        // it into this customized generated project. Without this step Gradle
+        // packages the stale assets left by the old SMS experiment.
+        val frontend = project.projectDir.resolve("../../../../dist").canonicalFile
+        if (!frontend.isDirectory) {
+            throw GradleException("Expected built frontend at $frontend")
+        }
+        project.copy {
+            from(frontend)
+            into(project.file("src/main/assets"))
+        }
     }
 }

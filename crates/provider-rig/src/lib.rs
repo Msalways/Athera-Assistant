@@ -1,7 +1,10 @@
 use assistant_contracts::factory::{FactoryError, ProviderFactory, ResolvedModelClient};
 use assistant_contracts::provider::AuthKind;
 
+pub mod client;
+pub mod cloud;
 pub mod convert;
+pub mod transport;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum RigAdapterError {
@@ -9,6 +12,8 @@ pub enum RigAdapterError {
     Factory(#[from] FactoryError),
     #[error("Request failed: {0}")]
     RequestFailed(String),
+    #[error("Provider error: {0:?}")]
+    Normalized(assistant_contracts::model::NormalizedError),
 }
 
 pub struct RigProviderAdapter {
@@ -111,6 +116,7 @@ mod tests {
             }],
             availability: ProviderAvailability::Available,
             documentation_url: Some("https://platform.openai.com/docs".into()),
+            default_base_url: Some("https://api.openai.com/v1".into()),
         }
     }
 

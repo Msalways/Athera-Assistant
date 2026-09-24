@@ -14,6 +14,7 @@ assistant-core = { path = "crates/assistant-core" }
 storage-sqlite = { path = "crates/storage-sqlite" }
 provider-cloud = { path = "crates/provider-cloud" }
 provider-needle = { path = "crates/provider-needle" }
+provider-rig = { path = "crates/provider-rig" }
 provider-local-chat = { path = "crates/provider-local-chat" }
 adapter-mcp = { path = "crates/adapter-mcp" }
 app-runtime = { path = "crates/app-runtime" }
@@ -21,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
+futures = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

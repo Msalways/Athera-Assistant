@@ -12,6 +12,25 @@ val tauriProperties = Properties().apply {
         propFile.inputStream().use { load(it) }
     }
 }
+val oauthRedirectHost = providers.gradleProperty("oauthRedirectHost").orElse("oauth.invalid").get()
+val oauthRedirectPath = providers.gradleProperty("oauthRedirectPath").orElse("/oauth/callback").get()
+check(oauthRedirectHost.matches(Regex("[A-Za-z0-9.-]+"))) { "oauthRedirectHost must be a DNS host" }
+check(oauthRedirectPath.startsWith("/") && !oauthRedirectPath.contains("#")) {
+    "oauthRedirectPath must be an absolute path without a fragment"
+}
+
+val syncFrontendAssets by tasks.registering(Sync::class) {
+    from(file("../../../../dist"))
+    from(file("../../../tauri.conf.json"))
+    into(layout.projectDirectory.dir("src/main/assets"))
+}
+
+// Every packaging and reporting task reads the synced assets directory,
+// so order the sync before the whole build lifecycle instead of naming
+// individual consumers (asset merge and lint-model tasks read these outputs).
+tasks.named("preBuild").configure {
+    dependsOn(syncFrontendAssets)
+}
 
 android {
     sourceSets {
@@ -30,6 +49,8 @@ android {
     namespace = "dev.local.assistant"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
+        manifestPlaceholders["oauthRedirectHost"] = oauthRedirectHost
+        manifestPlaceholders["oauthRedirectPath"] = oauthRedirectPath
         applicationId = "dev.local.assistant"
         minSdk = 31
         targetSdk = 36
@@ -49,6 +70,9 @@ android {
             }
         }
         getByName("release") {
+            check(oauthRedirectHost != "oauth.invalid") {
+                "Release builds require -PoauthRedirectHost=<verified App Link host>"
+            }
             signingConfig = signingConfigs.getByName("localTest")
             isMinifyEnabled = true
             proguardFiles(
@@ -71,6 +95,7 @@ rust {
 }
 
 dependencies {
+    implementation("androidx.browser:browser:1.8.0")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

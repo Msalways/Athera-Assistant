@@ -43,6 +43,8 @@ pub struct CredentialRequest {
     pub resource: String,
     pub purpose: CredentialPurpose,
     pub secret_ref: String,
+    pub authorization_server: Option<String>,
+    pub requested_scopes: Vec<String>,
 }
 
 #[async_trait]
@@ -171,17 +173,30 @@ impl McpAuthentication {
         let Some(secret_ref) = self.credential_reference() else {
             return Ok(None);
         };
-        let (resource, purpose) = match self {
-            Self::BearerToken { .. } => {
-                (endpoint.as_str().to_owned(), CredentialPurpose::BearerToken)
-            }
+        let (resource, purpose, authorization_server, requested_scopes) = match self {
+            Self::BearerToken { .. } => (
+                endpoint.as_str().to_owned(),
+                CredentialPurpose::BearerToken,
+                None,
+                vec![],
+            ),
             Self::ApiKeyHeader { .. } => (
                 endpoint.as_str().to_owned(),
                 CredentialPurpose::ApiKeyHeader,
+                None,
+                vec![],
             ),
-            Self::OauthAuthorizationCode { resource, .. } => {
-                (resource.clone(), CredentialPurpose::OauthAccessToken)
-            }
+            Self::OauthAuthorizationCode {
+                authorization_server,
+                resource,
+                requested_scopes,
+                ..
+            } => (
+                resource.clone(),
+                CredentialPurpose::OauthAccessToken,
+                Some(authorization_server.clone()),
+                requested_scopes.clone(),
+            ),
             Self::None => return Ok(None),
         };
         Ok(Some(CredentialRequest {
@@ -190,6 +205,8 @@ impl McpAuthentication {
             resource,
             purpose,
             secret_ref: secret_ref.to_owned(),
+            authorization_server,
+            requested_scopes,
         }))
     }
 }

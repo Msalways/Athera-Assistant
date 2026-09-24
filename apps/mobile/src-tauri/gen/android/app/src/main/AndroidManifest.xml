@@ -14,7 +14,7 @@
         android:theme="@style/Theme.assistant_mobile_shell"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
         <service android:name=".SmsAccessibilityService"
-            android:label="Needle SMS experiment"
+            android:label="Athera"
             android:exported="true"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
@@ -31,6 +31,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
                 <!-- AndroidTV support -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="${oauthRedirectHost}"
+                    android:pathPrefix="${oauthRedirectPath}" />
             </intent-filter>
         </activity>
 
