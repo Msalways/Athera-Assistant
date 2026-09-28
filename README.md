@@ -88,8 +88,10 @@ npm run dev
 
 ### Android build
 
+The normal assistant APK is built from the current frontend bundle:
+
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-sms-apk.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android-apk.ps1
 ```
 
 ## Repository structure

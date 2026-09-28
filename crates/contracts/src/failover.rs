@@ -1,9 +1,13 @@
 use crate::catalog::ProviderCatalog;
+use crate::model::NormalizedError;
 use crate::provider::{AuthKind, ProviderAvailability, ProviderDefinition};
 use crate::requirements::{PrivacyClass, TaskRequirements};
 use serde::{Deserialize, Serialize};
 
 pub const FAILOVER_POLICY_SCHEMA_V1: &str = "aethra.failover-policy.v1";
+/// At most one cloud fallback after the primary, so a turn cannot silently fan
+/// out across many vendors before the user learns anything.
+pub const FAILOVER_MAX_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum FailoverError {
@@ -30,6 +34,11 @@ pub struct FailoverPolicy {
     pub schema: String,
     pub primary_provider_id: String,
     pub fallback_provider_ids: Vec<String>,
+    /// Allow the on-device provider to answer after the cloud chain is
+    /// exhausted. Off by default: moving to a model that runs on this device is
+    /// a capability downgrade, not an equivalent retry, so it is never assumed.
+    #[serde(default)]
+    pub local_fallback: bool,
 }
 
 impl FailoverPolicy {
@@ -90,6 +99,28 @@ pub fn compatible_fallback(
     Ok(())
 }
 
+/// Whether a failure is transient enough that a different provider might
+/// legitimately succeed, versus a failure that describes the user's own setup.
+///
+/// Only transient, provider-independent conditions may fail over. A rejected
+/// credential, an unknown model, a bad endpoint, or a stream the provider could
+/// not produce are configuration and capability facts: moving to another vendor
+/// would hide them and send the request somewhere the user did not choose.
+pub fn may_fail_over(error: &NormalizedError) -> bool {
+    match error {
+        NormalizedError::NetworkUnavailable
+        | NormalizedError::Timeout
+        | NormalizedError::RateLimited { .. }
+        | NormalizedError::QuotaExceeded => true,
+        NormalizedError::ProviderError { status, .. } => *status >= 500 || *status == 0,
+        NormalizedError::AuthenticationFailed
+        | NormalizedError::AuthorizationDenied
+        | NormalizedError::ModelNotFound
+        | NormalizedError::EndpointNotFound
+        | NormalizedError::InvalidResponse { .. } => false,
+    }
+}
+
 fn shares_auth_kind(primary: &ProviderDefinition, candidate: &ProviderDefinition) -> bool {
     candidate.auth_options.iter().any(|option| {
         option.auth_kind != AuthKind::None
@@ -110,6 +141,7 @@ mod tests {
             schema: FAILOVER_POLICY_SCHEMA_V1.into(),
             primary_provider_id: "openai".into(),
             fallback_provider_ids: vec!["nvidia-nim".into()],
+            local_fallback: false,
         }
     }
 
@@ -201,5 +233,52 @@ mod tests {
     fn anthropic_seed_helpers_exist() {
         openai_definition().validate().unwrap();
         anthropic_definition().validate().unwrap();
+    }
+
+    #[test]
+    fn transient_conditions_may_fail_over() {
+        assert!(may_fail_over(&NormalizedError::NetworkUnavailable));
+        assert!(may_fail_over(&NormalizedError::Timeout));
+        assert!(may_fail_over(&NormalizedError::RateLimited {
+            retry_after_secs: Some(30)
+        }));
+        assert!(may_fail_over(&NormalizedError::QuotaExceeded));
+        assert!(may_fail_over(&NormalizedError::ProviderError {
+            status: 503,
+            detail: String::new()
+        }));
+    }
+
+    #[test]
+    fn setup_and_capability_faults_never_fail_over() {
+        // A rejected key, an unknown model, a bad endpoint, or a stream the
+        // provider could not produce describe the user's setup. Moving to
+        // another vendor would hide that and leak the prompt elsewhere.
+        for error in [
+            NormalizedError::AuthenticationFailed,
+            NormalizedError::AuthorizationDenied,
+            NormalizedError::ModelNotFound,
+            NormalizedError::EndpointNotFound,
+            NormalizedError::InvalidResponse {
+                detail: "stream produced no content".into(),
+            },
+            NormalizedError::ProviderError {
+                status: 404,
+                detail: String::new(),
+            },
+        ] {
+            assert!(!may_fail_over(&error), "must not fail over: {error:?}");
+        }
+    }
+
+    #[test]
+    fn attempt_cap_is_bounded() {
+        assert_eq!(FAILOVER_MAX_ATTEMPTS, 2);
+        let chain = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let used = chain.len().min(FAILOVER_MAX_ATTEMPTS);
+        assert_eq!(
+            used, 2,
+            "one fallback after the primary, never the whole chain"
+        );
     }
 }

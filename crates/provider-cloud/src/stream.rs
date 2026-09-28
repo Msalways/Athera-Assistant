@@ -197,8 +197,9 @@ mod tests {
         let deltas = Arc::new(Mutex::new(Vec::new()));
         let captured = deltas.clone();
         let sink = Arc::new(move |event| {
-            let ProviderEvent::TextDelta { text } = event;
-            captured.lock().unwrap().push(text);
+            if let ProviderEvent::TextDelta { text } = event {
+                captured.lock().unwrap().push(text);
+            }
             Ok(())
         });
         (sink, deltas)

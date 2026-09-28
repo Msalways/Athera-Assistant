@@ -24,6 +24,7 @@ pub mod graph;
 pub mod identity;
 pub mod jobs;
 pub mod lifecycle;
+pub mod local_probe;
 pub mod local_response;
 pub mod model;
 pub mod oauth;
@@ -37,6 +38,7 @@ pub mod provider_health;
 pub mod provider_profile;
 pub mod requirements;
 pub mod router;
+pub mod routing;
 pub mod sigv4;
 pub mod vault;
 pub use blocker::*;
@@ -303,6 +305,15 @@ pub struct Task {
     pub output: Option<AssistantOutput>,
     #[serde(default)]
     pub work_graph: Option<WorkGraph>,
+    /// The provider that produced this turn's answer. Recorded per task so a
+    /// fallback is visible on the turn it happened, not just the latest one.
+    #[serde(default)]
+    pub answered_by: Option<String>,
+    /// The capability this turn invoked, if any. A turn's pending action is
+    /// cleared once it runs, so without this the record of what a task actually
+    /// did disappears as soon as it did it.
+    #[serde(default)]
+    pub invoked_tool: Option<String>,
     pub failures: u32,
     pub call_counts: BTreeMap<String, u32>,
 }
@@ -324,6 +335,8 @@ impl Task {
             message: String::new(),
             output: None,
             work_graph: None,
+            answered_by: None,
+            invoked_tool: None,
             failures: 0,
             call_counts: BTreeMap::new(),
         }
@@ -363,10 +376,44 @@ pub struct ModelCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderEvent {
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
+    /// Emitted once a provider has been selected and is beginning to answer,
+    /// so a turn stays attributable even when a fallback moved vendors.
+    ProviderSelected {
+        provider_id: String,
+    },
 }
 
 pub type ProviderEventSink = std::sync::Arc<dyn Fn(ProviderEvent) -> Result<()> + Send + Sync>;
+
+/// Best-effort mapping from the engine's small error set onto the provider
+/// vocabulary.
+///
+/// This mapping is lossy: the engine cannot tell a dead network from a wrong
+/// endpoint, so both arrive as a provider error with no status. A provider that
+/// knows better must override `infer_typed` rather than rely on this.
+pub fn normalized_from_engine(error: Error) -> NormalizedError {
+    match error {
+        Error::AuthRequired => NormalizedError::AuthenticationFailed,
+        Error::Denied => NormalizedError::AuthorizationDenied,
+        Error::Timeout => NormalizedError::Timeout,
+        Error::RateLimited => NormalizedError::RateLimited {
+            retry_after_secs: None,
+        },
+        Error::InvalidResponse => NormalizedError::InvalidResponse {
+            detail: "provider response is invalid".into(),
+        },
+        Error::Unavailable => NormalizedError::ProviderError {
+            status: 0,
+            detail: "provider unavailable".into(),
+        },
+        other => NormalizedError::InvalidResponse {
+            detail: other.to_string(),
+        },
+    }
+}
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
@@ -384,6 +431,25 @@ pub trait ModelProvider: Send + Sync {
         _sink: ProviderEventSink,
     ) -> Result<AgentAction> {
         self.infer(context).await
+    }
+
+    /// Inference that reports *why* it failed in the provider's own vocabulary.
+    ///
+    /// Anything that chooses between providers must use this rather than
+    /// `infer`, because the engine's error set cannot distinguish a dead
+    /// network, which is worth moving past, from a wrong endpoint or a rejected
+    /// key, which are the user's own setup and must be surfaced instead. The
+    /// default is lossy; providers with richer errors should override it.
+    async fn infer_typed(
+        &self,
+        context: ContextBundle,
+        sink: Option<ProviderEventSink>,
+    ) -> std::result::Result<AgentAction, NormalizedError> {
+        let outcome = match sink {
+            Some(sink) => self.infer_stream(context, sink).await,
+            None => self.infer(context).await,
+        };
+        outcome.map_err(normalized_from_engine)
     }
 }
 
@@ -450,6 +516,10 @@ pub trait Store: PersonalizationStore + Send + Sync {
     fn save_task_blocker(&self, task_id: Id, blocker: &TaskBlocker) -> Result<()>;
     fn task_blocker(&self, task_id: Id) -> Result<Option<TaskBlocker>>;
     fn delete_task_blocker(&self, task_id: Id) -> Result<()>;
+
+    /// Shadow observations of the on-device model, newest first.
+    fn save_local_probe(&self, probe: &local_probe::LocalProbe) -> Result<()>;
+    fn local_probes(&self, limit: usize) -> Result<Vec<local_probe::LocalProbe>>;
 
     // Durable job ledger (Phase 2)
     fn save_job(&self, job: &DurableJob) -> Result<()>;

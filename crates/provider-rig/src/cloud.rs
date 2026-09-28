@@ -9,6 +9,7 @@ use assistant_contracts::{
 use crate::transport::ProviderTransport;
 use crate::transport::{complete_transport, stream_transport};
 use crate::RigAdapterError;
+use assistant_contracts::ProviderEventSink;
 
 pub struct RigCloudProvider {
     provider_id: String,
@@ -32,11 +33,40 @@ impl RigCloudProvider {
     }
 
     fn model_name(&self) -> &str {
-        match &self.transport {
-            ProviderTransport::OpenAi { model, .. }
-            | ProviderTransport::Anthropic { model, .. }
-            | ProviderTransport::Gemini { model, .. } => model,
-            ProviderTransport::Azure { deployment, .. } => deployment,
+        self.transport.model()
+    }
+
+    pub fn probe_request(model: &str) -> ModelRequest {
+        ModelRequest {
+            schema: MODEL_REQUEST_SCHEMA_V1.into(),
+            messages: vec![ModelMessage {
+                role: ModelMessageRole::User,
+                content: "hi".into(),
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            model: model.to_owned(),
+            max_tokens: Some(16),
+            temperature: None,
+            stream: true,
+        }
+    }
+
+    /// Probe over the same streaming contract the assistant chats on.
+    ///
+    /// A unary probe can pass against a provider whose stream is broken or
+    /// empty, leaving setup green while every real message fails. Validating
+    /// the stream keeps one contract for connection test and normal use.
+    pub async fn probe(&self) -> std::result::Result<ModelResponse, RigAdapterError> {
+        let request = Self::probe_request(self.model_name());
+        let sink: ProviderEventSink = std::sync::Arc::new(|_| Ok(()));
+        match stream_transport(&self.transport, &request, &sink).await {
+            Ok(response) if response.content.trim().is_empty() => Err(RigAdapterError::Normalized(
+                NormalizedError::InvalidResponse {
+                    detail: "stream produced no content".into(),
+                },
+            )),
+            other => other,
         }
     }
 
@@ -86,6 +116,12 @@ impl RigCloudProvider {
             }),
             _ => Err(Error::InvalidResponse),
         }
+    }
+
+    /// Map an engine error into provider vocabulary without collapsing distinct
+    /// causes onto one variant.
+    pub fn typed_engine_error(error: Error) -> NormalizedError {
+        assistant_contracts::normalized_from_engine(error)
     }
 
     pub fn engine_error(error: RigAdapterError) -> Error {
@@ -141,6 +177,35 @@ impl ModelProvider for RigCloudProvider {
             .map_err(Self::engine_error)?;
         Self::action_from_response(response, &context)
     }
+
+    /// Overrides the lossy trait default: only this adapter knows the HTTP
+    /// status and the adapter-level fault behind a failure, which is what
+    /// separates "worth trying the next provider" from "the user's setup is
+    /// wrong".
+    async fn infer_typed(
+        &self,
+        context: ContextBundle,
+        sink: Option<assistant_contracts::ProviderEventSink>,
+    ) -> std::result::Result<AgentAction, NormalizedError> {
+        let typed = async {
+            let request = Self::request_from_context(self.model_name(), &context)
+                .map_err(Self::typed_engine_error)?;
+            let response = match &sink {
+                Some(sink) => stream_transport(&self.transport, &request, sink).await,
+                None => complete_transport(&self.transport, &request).await,
+            }
+            .map_err(|error| match error {
+                RigAdapterError::Normalized(normalized) => normalized,
+                other => NormalizedError::ProviderError {
+                    status: 0,
+                    detail: other.to_string(),
+                },
+            })?;
+            Self::action_from_response(response, &context).map_err(Self::typed_engine_error)
+        }
+        .await;
+        typed
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +228,19 @@ mod tests {
             tools: vec![],
             adaptive_rules: vec![],
         }
+    }
+
+    #[test]
+    fn probe_request_uses_the_configured_model_bounded_output_and_the_chat_stream_contract() {
+        let request = RigCloudProvider::probe_request("fixture-model");
+        assert_eq!(request.model, "fixture-model");
+        assert_eq!(request.max_tokens, Some(16));
+        // The probe must exercise the same streaming contract the assistant
+        // chats on, otherwise setup can pass against a provider that cannot
+        // actually stream a reply.
+        assert!(request.stream);
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].content, "hi");
     }
 
     #[test]

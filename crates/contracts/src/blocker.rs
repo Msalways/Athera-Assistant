@@ -36,6 +36,20 @@ pub enum TaskBlocker {
     CapabilityUnavailable {
         capability_id: String,
     },
+    /// The turn needed a reasoning model and none was reachable.
+    ///
+    /// Distinct from a provider fault on purpose: a missing key or a bad model is
+    /// the user's setup to fix, while an unreachable provider will fail the same
+    /// way on retry, so telling the user to go and check their settings would send
+    /// them somewhere that cannot help.
+    ReasoningUnavailable {
+        detail: String,
+    },
+    /// The turn was kept on the device and no on-device model could answer it.
+    /// Not an error: the request was honoured by declining to send it.
+    HeldOnDevice {
+        detail: String,
+    },
 }
 
 impl TaskBlocker {
@@ -53,6 +67,12 @@ impl TaskBlocker {
             Self::DeviceConstraint { .. } => "Wait for the device constraint to resolve.",
             Self::CapabilityUnavailable { .. } => {
                 "Connect a service that provides this capability."
+            }
+            Self::ReasoningUnavailable { .. } => {
+                "Reconnect or configure a model provider, then run this again."
+            }
+            Self::HeldOnDevice { .. } => {
+                "This was kept on your device and could not be answered here."
             }
         }
     }
@@ -94,6 +114,16 @@ impl TaskBlocker {
             Self::CapabilityUnavailable { capability_id } => {
                 if capability_id.is_empty() {
                     return Err("capability_id is required");
+                }
+            }
+            Self::ReasoningUnavailable { detail } => {
+                if detail.is_empty() {
+                    return Err("detail is required");
+                }
+            }
+            Self::HeldOnDevice { detail } => {
+                if detail.is_empty() {
+                    return Err("detail is required");
                 }
             }
         }

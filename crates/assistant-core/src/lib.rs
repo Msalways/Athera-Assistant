@@ -1,5 +1,5 @@
 //! The assistant owns decisions about execution. Models only propose actions.
-mod context;
+pub mod context;
 mod engine;
 mod graph;
 mod learning;

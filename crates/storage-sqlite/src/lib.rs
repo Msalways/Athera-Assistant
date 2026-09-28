@@ -115,6 +115,17 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../../migrations/010_jobs.sql"))
                 .map_err(|_| Error::Storage)?;
         }
+        if !tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=11)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(|_| Error::Storage)?
+        {
+            tx.execute_batch(include_str!("../../../migrations/011_local_probes.sql"))
+                .map_err(|_| Error::Storage)?;
+        }
         tx.execute(
             "UPDATE messages SET status='interrupted' WHERE status='generating'",
             [],
@@ -147,6 +158,8 @@ pub(crate) fn blocker_kind(blocker: &TaskBlocker) -> &'static str {
         TaskBlocker::ClarificationRequired { .. } => "clarification_required",
         TaskBlocker::DeviceConstraint { .. } => "device_constraint",
         TaskBlocker::CapabilityUnavailable { .. } => "capability_unavailable",
+        TaskBlocker::ReasoningUnavailable { .. } => "reasoning_unavailable",
+        TaskBlocker::HeldOnDevice { .. } => "held_on_device",
     }
 }
 
@@ -621,6 +634,37 @@ impl Store for SqliteStore {
         )
         .map_err(|_| Error::Storage)?;
         Ok(())
+    }
+
+    fn save_local_probe(&self, probe: &local_probe::LocalProbe) -> Result<()> {
+        probe.validate().map_err(|_| Error::InvalidInput)?;
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        conn.execute(
+            "INSERT INTO local_probes(id, task_id, conversation_id, data, created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+            params![
+                probe.id.to_string(),
+                probe.task_id.to_string(),
+                probe.conversation_id.to_string(),
+                encode(probe)?,
+                timestamp(probe.created_at)?,
+            ],
+        )
+        .map_err(|_| Error::Storage)?;
+        Ok(())
+    }
+
+    fn local_probes(&self, limit: usize) -> Result<Vec<local_probe::LocalProbe>> {
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        let mut stmt = conn
+            .prepare("SELECT data FROM local_probes ORDER BY created_at DESC, id DESC LIMIT ?1")
+            .map_err(|_| Error::Storage)?;
+        let rows = stmt
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| Error::Storage)?;
+        rows.map(|r| decode(r.map_err(|_| Error::Storage)?))
+            .collect()
     }
 
     fn job(&self, id: &str) -> Result<Option<DurableJob>> {

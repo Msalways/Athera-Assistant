@@ -187,6 +187,286 @@ async fn web_key_is_session_only_endpoint_bound_and_replaceable() {
 }
 
 #[tokio::test]
+async fn catalog_provider_key_is_reported_and_restored_after_restart() {
+    let path = std::env::temp_dir().join(format!("assistant-provider-test-{}.db", Id::new_v4()));
+    let key = "fixture-provider-key-not-a-real-credential";
+    let runtime = Runtime::open(&path).unwrap();
+    runtime
+        .dispatch(
+            "save_provider_profile",
+            serde_json::json!({
+                "provider_id": "nvidia-nim",
+                "auth_option_id": "api_key",
+                "config": {"model": "fixture-model"},
+                "secret": key
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.snapshot().await.unwrap()["cloud_credential"],
+        "configured"
+    );
+    runtime
+        .dispatch(
+            "save_provider_profile",
+            serde_json::json!({
+                "provider_id": "nvidia-nim",
+                "auth_option_id": "api_key",
+                "config": {"model": "updated-fixture-model"},
+                "secret": null
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .store
+            .provider_profile("nvidia-nim")
+            .unwrap()
+            .unwrap()
+            .non_secret_config["model"],
+        "updated-fixture-model"
+    );
+    drop(runtime);
+
+    let reopened = Runtime::open(&path).unwrap();
+    assert_eq!(
+        reopened.snapshot().await.unwrap()["cloud_credential"],
+        "missing"
+    );
+    reopened
+        .restore_provider_key("nvidia-nim", "api_key", key.into())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.snapshot().await.unwrap()["cloud_credential"],
+        "configured"
+    );
+    let profiles = reopened
+        .dispatch("list_provider_profiles", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(profiles[0]["key_configured"], true);
+    assert!(!profiles.to_string().contains(key));
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn profile_resolution_skips_unusable_entries_and_honors_the_active_profile() {
+    let runtime = Runtime::open(":memory:").unwrap();
+    let mut malformed = ProviderProfile::new("openai", "api_key");
+    malformed.non_secret_config = serde_json::json!({});
+    runtime.store.save_provider_profile(&malformed).unwrap();
+
+    let mut missing_secret = ProviderProfile::new("gemini", "api_key");
+    missing_secret.non_secret_config = serde_json::json!({"model": "fixture-gemini"});
+    runtime
+        .store
+        .save_provider_profile(&missing_secret)
+        .unwrap();
+
+    let mut nvidia = ProviderProfile::new("nvidia-nim", "api_key");
+    nvidia.non_secret_config = serde_json::json!({"model": "fixture-nvidia"});
+    runtime.store.save_provider_profile(&nvidia).unwrap();
+    runtime
+        .secrets
+        .set_provider_key("nvidia-nim", "api_key", "fixture-nvidia-key".into())
+        .unwrap();
+
+    let selected = resolve_profile_transport(&runtime.store, &runtime.secrets, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.provider_id, "nvidia-nim");
+
+    let mut anthropic = ProviderProfile::new("anthropic", "api_key");
+    anthropic.non_secret_config = serde_json::json!({"model": "fixture-anthropic"});
+    runtime.store.save_provider_profile(&anthropic).unwrap();
+    runtime
+        .secrets
+        .set_provider_key("anthropic", "api_key", "fixture-anthropic-key".into())
+        .unwrap();
+
+    runtime
+        .store
+        .set_setting("active_provider_id", &serde_json::json!("anthropic"))
+        .unwrap();
+    let selected = resolve_profile_transport(&runtime.store, &runtime.secrets, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.provider_id, "anthropic");
+}
+
+#[tokio::test]
+async fn an_unusable_active_profile_does_not_fall_back_to_an_unselected_provider() {
+    let runtime = Runtime::open(":memory:").unwrap();
+    let mut active = ProviderProfile::new("openai", "api_key");
+    active.non_secret_config = serde_json::json!({"model": "fixture-openai"});
+    runtime.store.save_provider_profile(&active).unwrap();
+
+    let mut fallback = ProviderProfile::new("nvidia-nim", "api_key");
+    fallback.non_secret_config = serde_json::json!({"model": "fixture-nvidia"});
+    runtime.store.save_provider_profile(&fallback).unwrap();
+    runtime
+        .secrets
+        .set_provider_key("nvidia-nim", "api_key", "fixture-nvidia-key".into())
+        .unwrap();
+    runtime
+        .store
+        .set_setting("active_provider_id", &serde_json::json!("openai"))
+        .unwrap();
+
+    assert!(matches!(
+        resolve_profile_transport(&runtime.store, &runtime.secrets, None),
+        Err(Error::AuthRequired)
+    ));
+    assert_eq!(blocked_profile_id(&runtime.store).unwrap(), "openai");
+    assert!(matches!(
+        runtime
+            .dispatch(
+                "test_provider_connection",
+                serde_json::json!({"provider_id": "openai"}),
+            )
+            .await,
+        Err(Error::AuthRequired)
+    ));
+}
+
+#[tokio::test]
+async fn a_selected_profile_without_a_key_pauses_with_its_own_blocker() {
+    let fast = Arc::new(assistant_core::testing::ScriptedProvider::new(
+        true,
+        vec![AgentAction::Handoff {
+            role: Role::Reasoner,
+            objective: "answer".into(),
+            reason: "use the cloud".into(),
+        }],
+    ));
+    let runtime = Runtime::open_with_fast_provider(":memory:", fast).unwrap();
+    let mut profile = ProviderProfile::new("openai", "api_key");
+    profile.non_secret_config = serde_json::json!({"model": "fixture-openai"});
+    runtime.store.save_provider_profile(&profile).unwrap();
+    runtime
+        .store
+        .set_setting("active_provider_id", &serde_json::json!("openai"))
+        .unwrap();
+    runtime.refresh_cloud_provider().await.unwrap();
+
+    let task = runtime
+        .dispatch(
+            "submit_input",
+            serde_json::json!({
+                "conversation_id": Id::new_v4(),
+                "text": "hi",
+                "source": "text"
+            }),
+        )
+        .await
+        .unwrap();
+    let task_id = Id::parse_str(task["id"].as_str().unwrap()).unwrap();
+    for _ in 0..100 {
+        if runtime.store.task(task_id).unwrap().status == TaskStatus::WaitingForAuth {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let blocked = runtime.store.task(task_id).unwrap();
+    assert_eq!(blocked.status, TaskStatus::WaitingForAuth);
+    assert!(matches!(
+        runtime.store.task_blocker(task_id).unwrap(),
+        Some(TaskBlocker::ProviderCredentialRequired { provider_id }) if provider_id == "openai"
+    ));
+}
+
+#[test]
+fn connection_test_messages_do_not_echo_provider_bodies() {
+    let (_, message) = test_failure(&NormalizedError::ProviderError {
+        status: 500,
+        detail: "upstream echoed fixture-secret".into(),
+    });
+    assert!(!message.contains("fixture-secret"));
+    assert!(message.contains("provider returned an error"));
+}
+
+#[tokio::test]
+async fn provider_profile_rejects_secret_fields_before_persistence() {
+    let runtime = Runtime::open(":memory:").unwrap();
+    let secret = "fixture-secret-field";
+    let result = runtime
+        .dispatch(
+            "save_provider_profile",
+            serde_json::json!({
+                "provider_id": "nvidia-nim",
+                "auth_option_id": "api_key",
+                "config": {"model": "fixture-model", "api_key": secret},
+                "secret": secret
+            }),
+        )
+        .await;
+    assert_eq!(result, Err(Error::InvalidInput));
+    assert!(runtime
+        .store
+        .provider_profile("nvidia-nim")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        runtime
+            .dispatch(
+                "save_provider_profile",
+                serde_json::json!({
+                    "provider_id": "openai-compatible",
+                    "auth_option_id": "none",
+                    "config": {
+                        "base_url": "https://fixture.example/v1",
+                        "model": "fixture-model",
+                        "api_key": secret
+                    },
+                    "secret": null
+                }),
+            )
+            .await,
+        Err(Error::InvalidInput)
+    );
+    assert!(runtime
+        .store
+        .provider_profile("openai-compatible")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn startup_recovery_requeues_an_ordinary_task_and_provider_failure_is_terminal() {
+    let path = std::env::temp_dir().join(format!("assistant-task-recovery-{}.db", Id::new_v4()));
+    let store = SqliteStore::open(&path).unwrap();
+    let mut task = Task::new(UserInput {
+        conversation_id: Id::new_v4(),
+        text: "proof retry".into(),
+        source: InputSource::Text,
+    });
+    task.status = TaskStatus::Running;
+    task.step = 1;
+    task.failures = 1;
+    task.message = "Provider response is invalid".into();
+    store.save_task(&task).unwrap();
+    drop(store);
+
+    let fast = Arc::new(assistant_core::testing::ScriptedProvider::new(true, vec![]));
+    let runtime = Runtime::open_with_fast_provider(&path, fast).unwrap();
+    for _ in 0..100 {
+        if runtime.store.task(task.id).unwrap().status.terminal() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let recovered = runtime.store.task(task.id).unwrap();
+    assert_eq!(recovered.status, TaskStatus::Failed);
+    assert!(!recovered.message.contains("fixture"));
+    drop(runtime);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn malformed_keys_never_change_configuration() {
     let runtime = Runtime::open(":memory:").unwrap();
     let cloud = settings("ASSISTANT_FIXTURE_KEY").cloud.unwrap();

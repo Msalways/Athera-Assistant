@@ -1,5 +1,18 @@
 //! Application assembly shared by Tauri and the local development host.
 use adapter_mcp::{AuthorizationCallback, ConnectionConfig, McpAuthentication, McpManager};
+use assistant_contracts::catalog::ProviderCatalog;
+
+pub mod failover;
+pub mod needle_shadow;
+
+#[cfg(test)]
+mod failover_tests;
+
+/// Settings key holding an explicit, ordered failover policy. Absent means the
+/// assistant uses a single provider and never changes vendor on its own.
+pub const FAILOVER_POLICY_SETTING: &str = "failover_policy";
+
+type StdMutex<T> = std::sync::Mutex<T>;
 use assistant_contracts::provider::AuthKind;
 use assistant_contracts::*;
 use assistant_core::{registry, Assistant};
@@ -92,6 +105,12 @@ pub struct Runtime {
     conversations: Arc<conversations::Conversations>,
     local_models: local_models::LocalModels,
     companion_gate: tokio::sync::Mutex<()>,
+    /// Which provider most recently answered, when an explicit chain is
+    /// configured. Surfaced so a fallback is never invisible.
+    served_by: Arc<StdMutex<Option<String>>>,
+    /// Observes the on-device model without letting it act. `None` when no local
+    /// model is provisioned, which is the normal case.
+    shadow: Option<Arc<needle_shadow::NeedleShadow>>,
 }
 impl Runtime {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -180,16 +199,21 @@ impl Runtime {
                     .unwrap_or_else(NeedleProvider::unavailable),
             )
         });
+        let served_by = Arc::new(StdMutex::new(None));
         let assistant = assemble(
-            store.clone(),
-            mcp.clone(),
-            fast.clone(),
-            injected_executor.clone(),
+            AssemblyDeps::new(
+                store.clone(),
+                mcp.clone(),
+                fast.clone(),
+                injected_executor.clone(),
+                served_by.clone(),
+            ),
             &settings,
             &secrets,
             &oauth,
         )?;
-        let recovery = assistant.recover_unfinished_graphs()?;
+        let mut recovery = assistant.recover_unfinished_graphs()?;
+        recovery.extend(assistant.recover_unfinished_tasks()?);
         launch_recovery(assistant.clone(), recovery)?;
         personalization::kick_learning(assistant.clone());
         let conversations =
@@ -206,6 +230,8 @@ impl Runtime {
             conversations,
             local_models,
             companion_gate: tokio::sync::Mutex::new(()),
+            served_by,
+            shadow: needle_shadow::NeedleShadow::from_env().map(Arc::new),
         })
     }
     pub async fn snapshot(&self) -> Result<serde_json::Value> {
@@ -214,20 +240,15 @@ impl Runtime {
         for config in &settings.connections {
             connections.push(self.connection_state(config).await?);
         }
-        let cloud_credential = match &settings.cloud {
-            None => "not_configured",
-            Some(config) => {
-                if self
-                    .secrets
-                    .provider(config)
-                    .get(&config.secret_ref)
-                    .is_ok()
-                {
-                    "configured"
-                } else {
-                    "missing"
-                }
-            }
+        let profiles = self.store.provider_profiles()?;
+        let has_catalog_profile = profiles.iter().any(|profile| profile.enabled);
+        let cloud_credential = match resolve_profile_transport(&self.store, &self.secrets, None) {
+            Ok(Some(_)) => "configured",
+            Ok(None) if has_catalog_profile => "missing",
+            Ok(None) => legacy_cloud_credential(&settings, &self.secrets),
+            Err(Error::Storage) => return Err(Error::Storage),
+            Err(_) if has_catalog_profile => "missing",
+            Err(_) => legacy_cloud_credential(&settings, &self.secrets),
         };
         let cloud_session_key = settings
             .cloud
@@ -237,9 +258,100 @@ impl Runtime {
         let rule_proposals = self.store.rule_proposals(None, 100)?;
         let tasks = self.store.tasks()?;
         let suggestions = self.next_step_suggestions(&tasks);
+        let chain = resolve_failover_chain(&self.store, &self.secrets, None)?;
+        let probes = self.store.local_probes(SHADOW_PROBE_WINDOW)?;
+        let probe_stats = local_probe_stats(&probes, SHADOW_PROBE_GATE);
+        let shadow_state = serde_json::json!({
+            "provisioned": self.shadow.is_some(),
+            "observations": probe_stats.observed,
+            "judgeable": probe_stats.judgeable,
+            "agreed": probe_stats.agreed,
+            "abstained": probe_stats.abstained,
+            "uncalibrated": probe_stats.uncalibrated,
+            "agreement_rate": probe_stats.agreement_rate(),
+            "gated_agreement_rate": probe_stats.gated_agreement_rate(),
+            "gated_judgeable": probe_stats.gated_judgeable,
+            "gated_agreed": probe_stats.gated_agreed,
+            "threshold": probe_stats.threshold,
+        });
+        let display_names = provider_display_names();
+        let served_by = self.served_by.lock().ok().and_then(|value| value.clone());
+        let chain_view: Vec<serde_json::Value> = chain
+            .iter()
+            .map(|provider| {
+                serde_json::json!({
+                    "provider_id": provider.id(),
+                    "display_name": display_names
+                        .get(provider.id())
+                        .cloned()
+                        .unwrap_or_else(|| provider.id().to_owned()),
+                })
+            })
+            .collect();
         Ok(
-            serde_json::json!({"tasks":tasks,"capabilities":self.store.capabilities()?,"settings":settings,"connections":connections,"adaptive_rules":adaptive_rules,"rule_proposals":rule_proposals,"cloud_credential":cloud_credential,"cloud_session_key":cloud_session_key,"needle":if self.fast.is_available(){"ready"}else{"not_linked"},"voice":"deferred","suggestions":suggestions}),
+            serde_json::json!({"tasks":tasks,"capabilities":self.store.capabilities()?,"settings":settings,"connections":connections,"adaptive_rules":adaptive_rules,"rule_proposals":rule_proposals,"cloud_credential":cloud_credential,"cloud_session_key":cloud_session_key,"needle":if self.fast.is_available(){"ready"}else{"not_linked"},"voice":"deferred","suggestions":suggestions,"failover":{"configured":chain.len()>1,"chain":chain_view,"served_by":served_by},"local_shadow":shadow_state}),
         )
+    }
+
+    /// Run the on-device model alongside a turn purely to record what it would
+    /// have done, and let nothing it proposes reach an executor.
+    ///
+    /// The observation is fire-and-forget. A turn must never wait on a local
+    /// model that may be slow, absent, or broken, so a failure here is dropped
+    /// rather than surfaced: the cloud model is already answering, and the point
+    /// of shadow mode is that it cannot make the answer worse.
+    fn observe_shadow(&self, task_id: Id, text: String) {
+        let Some(shadow) = self.shadow.clone() else {
+            return;
+        };
+        let store = self.store.clone();
+        let conversation_id = self
+            .store
+            .task(task_id)
+            .map(|task| task.input.conversation_id)
+            .unwrap_or_else(|_| Id::nil());
+        tokio::spawn(async move {
+            // Wait until the cloud model has actually chosen something, so the
+            // comparison is against the decision the user was given rather than
+            // an intent that may still change. A turn awaiting approval counts:
+            // the cloud has decided, the user simply has not agreed yet.
+            let mut answered_with = None;
+            for _ in 0..120 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let Ok(task) = store.task(task_id) else {
+                    return;
+                };
+                if let Some(tool) = task.invoked_tool.clone() {
+                    answered_with = Some(tool);
+                    break;
+                }
+                if task.status.terminal() {
+                    break;
+                }
+            }
+            let Some(proposal) = shadow.observe(&text).await else {
+                return;
+            };
+            // The local model is offered tools positionally, as `tool_0`,
+            // `tool_1` and so on, while the cloud reports the real tool id.
+            // Recording the positional name would make the two look permanently
+            // different and the comparison meaningless, so translate it here.
+            let proposed_tool = proposal
+                .tool
+                .as_deref()
+                .map(|name| resolve_positional_tool(store.as_ref(), task_id, name));
+            let mut record = local_probe::LocalProbe::new(task_id, conversation_id);
+            record.proposed_tool = proposed_tool;
+            record.proposed_arguments = proposal.arguments;
+            record.confidence = proposal.confidence;
+            record.latency_ms = proposal.latency_ms;
+            record.answered_with_tool = answered_with;
+            record.created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default();
+            let _ = store.save_local_probe(&record);
+        });
     }
 
     /// Restores a platform-keystore credential into the in-memory provider scope.
@@ -250,14 +362,15 @@ impl Runtime {
 
     /// Restores a platform-keystore catalog provider key into the session scope.
     /// The value remains outside SQLite and model context.
-    pub fn restore_provider_key(
+    pub async fn restore_provider_key(
         &self,
         provider_id: &str,
         auth_option_id: &str,
         key: String,
     ) -> Result<()> {
         self.secrets
-            .set_provider_key(provider_id, auth_option_id, key)
+            .set_provider_key(provider_id, auth_option_id, key)?;
+        self.refresh_cloud_provider().await
     }
 
     fn next_step_suggestions(&self, tasks: &[Task]) -> Vec<serde_json::Value> {
@@ -314,6 +427,10 @@ impl Runtime {
             TaskBlocker::ClarificationRequired { .. } => "Answer the assistant's question",
             TaskBlocker::DeviceConstraint { .. } => "Resolve the device constraint",
             TaskBlocker::CapabilityUnavailable { .. } => "Connect a supporting service",
+            // Neither of these is fixed by connecting a service, so they must not
+            // offer to connect one.
+            TaskBlocker::ReasoningUnavailable { .. } => "No model provider is reachable",
+            TaskBlocker::HeldOnDevice { .. } => "Kept on this device",
         };
         (
             "connect_service",
@@ -439,10 +556,13 @@ impl Runtime {
             return Err(Error::Conflict);
         }
         let next = assemble(
-            self.store.clone(),
-            self.mcp.clone(),
-            self.fast.clone(),
-            self.tool_executor.clone(),
+            AssemblyDeps::new(
+                self.store.clone(),
+                self.mcp.clone(),
+                self.fast.clone(),
+                self.tool_executor.clone(),
+                self.served_by.clone(),
+            ),
             &settings,
             &self.secrets,
             &self.oauth,
@@ -541,6 +661,7 @@ impl Runtime {
                 let input: UserInput =
                     serde_json::from_value(payload).map_err(|_| Error::InvalidInput)?;
                 let task = assistant.submit(input)?;
+                self.observe_shadow(task.id, task.input.text.clone());
                 launch(assistant, task.id);
                 Ok(serde_json::json!(task))
             }
@@ -652,8 +773,24 @@ impl Runtime {
                     .iter()
                     .find(|option| option.id == request.auth_option_id)
                     .ok_or(Error::InvalidInput)?;
-                if !request.config.is_object() {
+                let config = request.config.as_object().ok_or(Error::InvalidInput)?;
+                if definition
+                    .endpoint_fields
+                    .iter()
+                    .chain(
+                        definition
+                            .auth_options
+                            .iter()
+                            .flat_map(|auth_option| auth_option.fields.iter()),
+                    )
+                    .any(|field| field.secret && config.contains_key(&field.id))
+                {
                     return Err(Error::InvalidInput);
+                }
+                if self.secrets.payload_contains_secret(&request.config)
+                    || self.oauth.payload_contains_secret(&request.config)
+                {
+                    return Err(Error::Denied);
                 }
                 if let Some(base_url) = request
                     .config
@@ -668,7 +805,13 @@ impl Runtime {
                 let needs_secret = option.auth_kind != AuthKind::None;
                 match (&request.secret, needs_secret) {
                     (Some(_), false) => return Err(Error::InvalidInput),
-                    (None, true) => return Err(Error::InvalidInput),
+                    (None, true)
+                        if !self
+                            .secrets
+                            .has_provider_key(&request.provider_id, &request.auth_option_id) =>
+                    {
+                        return Err(Error::InvalidInput);
+                    }
                     _ => {}
                 }
                 if let Some(secret) = &request.secret {
@@ -741,68 +884,38 @@ impl Runtime {
             }
             "test_provider_connection" => {
                 let provider_id = payload["provider_id"].as_str().ok_or(Error::InvalidInput)?;
-                let profile = self
-                    .store
-                    .provider_profile(provider_id)?
-                    .ok_or(Error::InvalidInput)?;
-                let catalog = assistant_contracts::catalog_seeds::default_catalog()
-                    .map_err(|_| Error::Storage)?;
-                let definition = catalog
-                    .get(&profile.provider_id)
-                    .ok_or(Error::InvalidInput)?;
-                let option = definition
-                    .auth_options
-                    .iter()
-                    .find(|option| option.id == profile.auth_option_id)
-                    .ok_or(Error::InvalidInput)?;
-                let secret = if option.auth_kind == AuthKind::None {
-                    None
-                } else {
-                    Some(
-                        self.secrets
-                            .provider_secret(&profile.provider_id, &profile.auth_option_id)?,
-                    )
-                };
-                let transport = provider_rig::transport::build_transport(
-                    definition,
-                    option,
-                    &profile.non_secret_config,
-                    secret.as_deref(),
+                let profile =
+                    resolve_profile_transport(&self.store, &self.secrets, Some(provider_id))?
+                        .ok_or(Error::InvalidInput)?;
+                let provider = provider_rig::cloud::RigCloudProvider::new(
+                    &profile.provider_id,
+                    profile.transport,
                 )
                 .map_err(|_| Error::InvalidInput)?;
-                let model = match &transport {
-                    provider_rig::transport::ProviderTransport::OpenAi { model, .. }
-                    | provider_rig::transport::ProviderTransport::Anthropic { model, .. }
-                    | provider_rig::transport::ProviderTransport::Gemini { model, .. } => {
-                        model.clone()
-                    }
-                    provider_rig::transport::ProviderTransport::Azure { deployment, .. } => {
-                        deployment.clone()
-                    }
-                };
-                let probe = ModelRequest {
-                    schema: MODEL_REQUEST_SCHEMA_V1.into(),
-                    messages: vec![ModelMessage {
-                        role: ModelMessageRole::User,
-                        content: "hi".into(),
-                        tool_call_id: None,
-                    }],
-                    tools: vec![],
-                    model: model.to_owned(),
-                    max_tokens: Some(16),
-                    temperature: None,
-                    stream: false,
-                };
                 let started = std::time::Instant::now();
-                match provider_rig::transport::complete_transport(&transport, &probe).await {
-                    Ok(response) => Ok(serde_json::to_value(
+                let budget = std::time::Duration::from_secs(
+                    self.settings.read().await.engine.timeout_seconds.max(1) as u64,
+                );
+                let outcome = tokio::time::timeout(budget, provider.probe()).await;
+                match outcome {
+                    Err(_) => Ok(serde_json::to_value(
+                        assistant_contracts::connection_test::ConnectionTestResult::failure(
+                            assistant_contracts::provider_health::NormalizedTestFailure::Network,
+                            &format!(
+                                "The provider did not answer within {} seconds. It may still be starting up; retry in a moment.",
+                                budget.as_secs()
+                            ),
+                        ),
+                    )
+                    .map_err(|_| Error::Storage)?),
+                    Ok(Ok(response)) => Ok(serde_json::to_value(
                         assistant_contracts::connection_test::ConnectionTestResult::success(
                             &response.model_id,
                             started.elapsed().as_millis() as u64,
                         ),
                     )
                     .map_err(|_| Error::Storage)?),
-                    Err(provider_rig::RigAdapterError::Normalized(error)) => {
+                    Ok(Err(provider_rig::RigAdapterError::Normalized(error))) => {
                         let (kind, message) = test_failure(&error);
                         Ok(serde_json::to_value(
                             assistant_contracts::connection_test::ConnectionTestResult::failure(
@@ -811,8 +924,38 @@ impl Runtime {
                         )
                         .map_err(|_| Error::Storage)?)
                     }
-                    Err(_) => Err(Error::Unavailable),
+                    Ok(Err(_)) => Err(Error::Unavailable),
                 }
+            }
+            "set_failover_policy" => {
+                let policy: assistant_contracts::failover::FailoverPolicy =
+                    serde_json::from_value(payload).map_err(|_| Error::InvalidInput)?;
+                policy.validate().map_err(|_| Error::InvalidInput)?;
+                // Only providers the user actually configured, each with its own
+                // stored credential, may join the chain.
+                let known = self.store.provider_profiles()?;
+                for id in policy.chain() {
+                    if !known
+                        .iter()
+                        .any(|profile| profile.provider_id == id && profile.enabled)
+                    {
+                        return Err(Error::InvalidInput);
+                    }
+                }
+                self.store.set_setting(
+                    FAILOVER_POLICY_SETTING,
+                    &serde_json::to_value(&policy).map_err(|_| Error::Storage)?,
+                )?;
+                let current = self.settings.read().await.clone();
+                self.configure(current).await?;
+                Ok(serde_json::json!(true))
+            }
+            "clear_failover_policy" => {
+                self.store
+                    .set_setting(FAILOVER_POLICY_SETTING, &serde_json::Value::Null)?;
+                let current = self.settings.read().await.clone();
+                self.configure(current).await?;
+                Ok(serde_json::json!(true))
             }
             "save_mcp_credential" => {
                 let request: SaveMcpCredential =
@@ -1039,10 +1182,13 @@ impl Runtime {
     pub async fn refresh_cloud_provider(&self) -> Result<()> {
         let settings = self.settings.read().await.clone();
         let assistant = assemble(
-            self.store.clone(),
-            self.mcp.clone(),
-            self.fast.clone(),
-            self.tool_executor.clone(),
+            AssemblyDeps::new(
+                self.store.clone(),
+                self.mcp.clone(),
+                self.fast.clone(),
+                self.tool_executor.clone(),
+                self.served_by.clone(),
+            ),
             &settings,
             &self.secrets,
             &self.oauth,
@@ -1066,6 +1212,18 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+fn legacy_cloud_credential(settings: &Settings, secrets: &Arc<SessionSecrets>) -> &'static str {
+    match &settings.cloud {
+        None => "not_configured",
+        Some(config) => {
+            if secrets.provider(config).get(&config.secret_ref).is_ok() {
+                "configured"
+            } else {
+                "missing"
+            }
+        }
     }
 }
 fn contains_secret(value: &serde_json::Value, secret: &str) -> bool {
@@ -1115,7 +1273,8 @@ fn test_failure(
         ),
         NormalizedError::ModelNotFound => (
             NormalizedTestFailure::ModelNotFound,
-            "The model was not found. Check the model ID.".into(),
+            "That model is not available. Check the model ID, or pick a model the provider still serves."
+                .into(),
         ),
         NormalizedError::RateLimited { .. } | NormalizedError::QuotaExceeded => (
             NormalizedTestFailure::Quota,
@@ -1125,13 +1284,13 @@ fn test_failure(
             NormalizedTestFailure::Network,
             "The network request failed. Check connectivity.".into(),
         ),
-        NormalizedError::InvalidResponse { detail } => (
+        NormalizedError::InvalidResponse { .. } => (
             NormalizedTestFailure::ProviderError,
-            format!("The provider returned an invalid response: {detail}"),
+            "The provider connected but did not return a usable answer. It may not support streaming replies.".into(),
         ),
-        NormalizedError::ProviderError { detail, .. } => (
+        NormalizedError::ProviderError { .. } => (
             NormalizedTestFailure::ProviderError,
-            format!("The provider returned an error: {detail}"),
+            "The provider returned an error.".into(),
         ),
     }
 }
@@ -1203,19 +1362,56 @@ async fn run_task(assistant: Arc<Assistant>, id: Id) {
             }
         }
     }
-    if let Ok(task) = assistant.store.task(id) {
+    if let Ok(mut task) = assistant.store.task(id) {
+        if matches!(task.status, TaskStatus::Created | TaskStatus::Running) {
+            task.status = TaskStatus::Failed;
+            task.message = "Task execution stopped before reaching a terminal state.".into();
+            let _ = assistant.store.save_task(&task);
+        }
         let _ = assistant.record_task_outcome(&task);
     }
 }
-fn assemble(
+/// Shared long-lived pieces an assembly needs. Bundled so the signature stays
+/// small and the attribution handle survives every reconfiguration.
+struct AssemblyDeps {
     store: Arc<SqliteStore>,
     mcp: Arc<McpManager>,
     fast: Arc<dyn ModelProvider>,
     injected_executor: Option<Arc<dyn ToolExecutor>>,
+    served_by: Arc<StdMutex<Option<String>>>,
+}
+
+impl AssemblyDeps {
+    fn new(
+        store: Arc<SqliteStore>,
+        mcp: Arc<McpManager>,
+        fast: Arc<dyn ModelProvider>,
+        injected_executor: Option<Arc<dyn ToolExecutor>>,
+        served_by: Arc<StdMutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            store,
+            mcp,
+            fast,
+            injected_executor,
+            served_by,
+        }
+    }
+}
+
+fn assemble(
+    deps: AssemblyDeps,
     settings: &Settings,
     secrets: &Arc<SessionSecrets>,
     oauth: &Arc<OAuthRuntime>,
 ) -> Result<Arc<Assistant>> {
+    let AssemblyDeps {
+        store,
+        mcp,
+        fast,
+        injected_executor,
+        served_by,
+    } = deps;
     let config = &settings.engine;
     if config.max_steps == 0
         || config.max_steps > 100
@@ -1230,15 +1426,42 @@ fn assemble(
     {
         return Err(Error::InvalidInput);
     }
-    let cloud: Arc<dyn ModelProvider> = match rig_cloud_provider(&store, secrets) {
-        Some(provider) => provider,
-        None => match &settings.cloud {
-            Some(config) => Arc::new(CloudProvider::new(
-                config.clone(),
-                secrets.provider(config),
-            )?),
-            None => Arc::new(NeedleProvider::unavailable()),
-        },
+    let has_catalog_profile = has_enabled_provider_profile(&store)?;
+    let blocked_profile_id = blocked_profile_id(&store)?;
+    // An explicit, ordered chain is opt-in. With no policy the resolution below
+    // is byte-for-byte the previous single-provider behaviour.
+    let chain = resolve_failover_chain(&store, secrets, Some(fast.clone()))?;
+    let cloud: Arc<dyn ModelProvider> = if chain.len() > 1 {
+        Arc::new(failover::FailoverCloud::with_attribution(
+            chain,
+            served_by.clone(),
+        ))
+    } else {
+        match resolve_profile_transport(&store, secrets, None) {
+            Ok(Some(profile)) => profile.into_model_provider()?,
+            Ok(None) if has_catalog_profile => Arc::new(BlockedCloudProvider::new(
+                blocked_profile_id.clone(),
+                Error::Unavailable,
+            )),
+            Ok(None) => match &settings.cloud {
+                Some(config) => Arc::new(CloudProvider::new(
+                    config.clone(),
+                    secrets.provider(config),
+                )?),
+                None => Arc::new(NeedleProvider::unavailable()),
+            },
+            Err(Error::Storage) => return Err(Error::Storage),
+            Err(error) if has_catalog_profile => {
+                Arc::new(BlockedCloudProvider::new(blocked_profile_id, error))
+            }
+            Err(_) => match &settings.cloud {
+                Some(config) => Arc::new(CloudProvider::new(
+                    config.clone(),
+                    secrets.provider(config),
+                )?),
+                None => Arc::new(NeedleProvider::unavailable()),
+            },
+        }
     };
     let secret_store = secrets.clone();
     let oauth_store = oauth.clone();
@@ -1276,52 +1499,323 @@ struct RoutingExecutor {
     mcp: Arc<McpManager>,
 }
 
-fn rig_cloud_provider(
+struct ResolvedProfileTransport {
+    provider_id: String,
+    transport: provider_rig::transport::ProviderTransport,
+}
+
+impl ResolvedProfileTransport {
+    fn into_model_provider(self) -> Result<Arc<dyn ModelProvider>> {
+        Ok(Arc::new(self.into_rig_provider()?))
+    }
+    fn into_rig_provider(self) -> Result<provider_rig::cloud::RigCloudProvider> {
+        provider_rig::cloud::RigCloudProvider::new(&self.provider_id, self.transport)
+            .map_err(|_| Error::InvalidInput)
+    }
+}
+
+fn has_enabled_provider_profile(store: &SqliteStore) -> Result<bool> {
+    Ok(store
+        .provider_profiles()?
+        .iter()
+        .any(|profile| profile.enabled))
+}
+
+fn blocked_profile_id(store: &SqliteStore) -> Result<String> {
+    let profiles = store.provider_profiles()?;
+    let active = store
+        .setting("active_provider_id")?
+        .and_then(|value| value.as_str().map(str::to_owned));
+    Ok(active
+        .and_then(|active| {
+            profiles
+                .iter()
+                .find(|profile| profile.provider_id == active && profile.enabled)
+                .map(|profile| profile.provider_id.clone())
+        })
+        .or_else(|| {
+            profiles
+                .iter()
+                .find(|profile| profile.enabled)
+                .map(|profile| profile.provider_id.clone())
+        })
+        .unwrap_or_else(|| "cloud-profile".into()))
+}
+
+fn build_profile_transport(
+    profile: &ProviderProfile,
+    catalog: &ProviderCatalog,
+    secrets: &SessionSecrets,
+) -> Result<ResolvedProfileTransport> {
+    profile.validate().map_err(|_| Error::InvalidInput)?;
+    if !profile.enabled || !profile.non_secret_config.is_object() {
+        return Err(Error::InvalidInput);
+    }
+    let definition = catalog
+        .get(&profile.provider_id)
+        .ok_or(Error::InvalidInput)?;
+    if definition.availability != assistant_contracts::provider::ProviderAvailability::Available {
+        return Err(Error::Unavailable);
+    }
+    let option = definition
+        .auth_options
+        .iter()
+        .find(|option| option.id == profile.auth_option_id)
+        .ok_or(Error::InvalidInput)?;
+    let secret = if option.auth_kind == AuthKind::None {
+        None
+    } else {
+        Some(secrets.provider_secret(&profile.provider_id, &profile.auth_option_id)?)
+    };
+    let transport = provider_rig::transport::build_transport(
+        definition,
+        option,
+        &profile.non_secret_config,
+        secret.as_deref(),
+    )
+    .map_err(|_| Error::InvalidInput)?;
+    Ok(ResolvedProfileTransport {
+        provider_id: profile.provider_id.clone(),
+        transport,
+    })
+}
+
+fn resolve_profile_transport(
     store: &SqliteStore,
     secrets: &SessionSecrets,
-) -> Option<Arc<dyn ModelProvider>> {
-    let profiles = store.provider_profiles().ok()?;
-    let active = store
-        .setting("active_provider_id")
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_owned));
-    let catalog = assistant_contracts::catalog_seeds::default_catalog().ok()?;
-    let mut ordered: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
-    ordered.sort_by_key(|profile| active.as_deref() != Some(profile.provider_id.as_str()));
-    for profile in ordered {
-        let definition = catalog.get(&profile.provider_id)?;
-        if definition.availability != assistant_contracts::provider::ProviderAvailability::Available
-        {
-            continue;
-        }
-        let option = definition
-            .auth_options
+    requested_provider_id: Option<&str>,
+) -> Result<Option<ResolvedProfileTransport>> {
+    let profiles = store.provider_profiles()?;
+    let catalog =
+        assistant_contracts::catalog_seeds::default_catalog().map_err(|_| Error::Storage)?;
+    if let Some(provider_id) = requested_provider_id {
+        let profile = profiles
             .iter()
-            .find(|option| option.id == profile.auth_option_id)?;
-        let secret = if option.auth_kind == AuthKind::None {
-            None
-        } else {
-            Some(
-                secrets
-                    .provider_secret(&profile.provider_id, &profile.auth_option_id)
-                    .ok()?,
-            )
-        };
-        let transport = provider_rig::transport::build_transport(
-            definition,
-            option,
-            &profile.non_secret_config,
-            secret.as_deref(),
-        )
-        .ok()?;
-        if let Ok(provider) =
-            provider_rig::cloud::RigCloudProvider::new(&profile.provider_id, transport)
+            .find(|profile| profile.provider_id == provider_id)
+            .ok_or(Error::InvalidInput)?;
+        return build_profile_transport(profile, &catalog, secrets).map(Some);
+    }
+    let active = store
+        .setting("active_provider_id")?
+        .and_then(|value| value.as_str().map(str::to_owned));
+    if let Some(active_id) = active.as_deref() {
+        if let Some(profile) = profiles
+            .iter()
+            .find(|profile| profile.provider_id == active_id)
         {
-            return Some(Arc::new(provider));
+            if !profile.enabled {
+                return Ok(None);
+            }
+            return build_profile_transport(profile, &catalog, secrets).map(Some);
         }
     }
-    None
+    for profile in profiles.iter().filter(|profile| profile.enabled) {
+        if let Ok(resolved) = build_profile_transport(profile, &catalog, secrets) {
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(None)
+}
+
+/// Build an ordered provider chain from an explicitly configured policy.
+///
+/// Returns an empty chain when no policy is configured, which keeps
+/// single-provider behaviour unchanged. Every member is built by resolving its
+/// own profile and its own stored credential, so a fallback can never reuse the
+/// primary's secret against a different host.
+///
+/// When the policy allows it, the on-device provider is appended as the final
+/// member so a cloud outage has somewhere local to go.
+fn resolve_failover_chain(
+    store: &SqliteStore,
+    secrets: &SessionSecrets,
+    local: Option<Arc<dyn ModelProvider>>,
+) -> Result<Vec<Arc<dyn ModelProvider>>> {
+    let policy_value = store.setting(FAILOVER_POLICY_SETTING)?;
+    // A cleared policy is stored as JSON null; treat it exactly like absent.
+    let Some(policy_value) = policy_value.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let policy: assistant_contracts::failover::FailoverPolicy =
+        serde_json::from_value(policy_value).map_err(|_| Error::InvalidInput)?;
+    policy.validate().map_err(|_| Error::InvalidInput)?;
+    let catalog =
+        assistant_contracts::catalog_seeds::default_catalog().map_err(|_| Error::Storage)?;
+    let mut chain: Vec<Arc<dyn ModelProvider>> = Vec::new();
+    for (position, provider_id) in policy.chain().into_iter().enumerate() {
+        let built = match store
+            .provider_profile(&provider_id)
+            .ok()
+            .flatten()
+            .filter(|profile| profile.enabled)
+        {
+            Some(profile) => build_profile_transport(&profile, &catalog, secrets),
+            None => Err(Error::Unavailable),
+        };
+        match built {
+            Ok(resolved) => {
+                chain.push(Arc::new(resolved.into_rig_provider()?) as Arc<dyn ModelProvider>);
+            }
+            Err(error) if position == 0 => {
+                // Hold the slot rather than dropping it. Dropping the primary
+                // would promote the fallback to first choice and answer as though
+                // nothing were wrong, hiding a missing key or an unusable model
+                // behind another vendor's name. The user set this order on
+                // purpose, so the fault is reported instead of the order changing
+                // quietly. Holding the slot is only half of it: the chain must
+                // also stop here rather than step over the block, which is why
+                // `BlockedCloudProvider` reports a fault that is not transient.
+                chain.push(Arc::new(BlockedCloudProvider::new(provider_id, error)));
+            }
+            // A fallback that cannot be prepared is only reached after the primary
+            // failed, so excluding it shortens the chain rather than deciding who
+            // answers.
+            Err(_) => continue,
+        }
+    }
+    if let Some(local) = local.filter(|_| policy.local_fallback) {
+        chain.push(local);
+    }
+    Ok(chain)
+}
+
+/// Translate the positional tool name the local model was offered into the real
+/// tool id the rest of the system uses.
+///
+/// The local model sees `tool_0`, `tool_1`, ... because that is how the shared
+/// protocol addresses capabilities, while a task records the actual tool id. The
+/// mapping is the same one `protocol::decode_call` applies, read from the same
+/// context the engine built, so the two can be compared at all.
+fn resolve_positional_tool(store: &SqliteStore, task_id: Id, offered: &str) -> String {
+    let Some(index) = offered
+        .strip_prefix("tool_")
+        .and_then(|rest| rest.parse::<usize>().ok())
+    else {
+        return offered.to_owned();
+    };
+    let Ok(task) = store.task(task_id) else {
+        return offered.to_owned();
+    };
+    let config = EngineConfig::default();
+    assistant_core::context::build(store, &task, &config)
+        .ok()
+        .and_then(|context| context.tools.get(index).map(|tool| tool.id.clone()))
+        .unwrap_or_else(|| offered.to_owned())
+}
+
+/// How many recent shadow observations the snapshot summarises.
+const SHADOW_PROBE_WINDOW: usize = 500;
+/// The confidence a local proposal must reach before it would be allowed to act.
+/// Nothing acts on this yet: it is the line the numbers are read against.
+const SHADOW_PROBE_GATE: f64 = 0.40;
+
+/// Summarise shadow observations into the question that decides whether a local
+/// fallback could ever be trusted: when the local model was confident, was it
+/// right?
+fn local_probe_stats(
+    probes: &[local_probe::LocalProbe],
+    gate: f64,
+) -> local_probe::LocalProbeStats {
+    let mut stats = local_probe::LocalProbeStats {
+        threshold: gate,
+        ..Default::default()
+    };
+    for probe in probes {
+        stats.observed += 1;
+        if probe.proposed_tool.is_none() {
+            stats.abstained += 1;
+        }
+        if probe.confidence.is_none() {
+            stats.uncalibrated += 1;
+        }
+        let Some(agreed) = probe.agreed() else {
+            continue;
+        };
+        stats.judgeable += 1;
+        if agreed {
+            stats.agreed += 1;
+        }
+        if probe
+            .confidence
+            .is_some_and(|confidence| confidence >= gate)
+        {
+            stats.gated_judgeable += 1;
+            if agreed {
+                stats.gated_agreed += 1;
+            }
+        }
+    }
+    stats
+}
+
+/// Provider id -> display name, so the UI can show a vendor's real name
+/// instead of a slug without having to load the catalog itself.
+fn provider_display_names() -> std::collections::HashMap<String, String> {
+    assistant_contracts::catalog_seeds::default_catalog()
+        .map(|catalog| {
+            catalog
+                .providers
+                .iter()
+                .map(|provider| (provider.id.clone(), provider.display_name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+struct BlockedCloudProvider {
+    id: String,
+    error: Error,
+}
+
+impl BlockedCloudProvider {
+    fn new(id: String, error: Error) -> Self {
+        Self { id, error }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for BlockedCloudProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn infer(&self, _: ContextBundle) -> Result<AgentAction> {
+        Err(self.error.clone())
+    }
+
+    /// Report the fault in a vocabulary that cannot be mistaken for a transient
+    /// one.
+    ///
+    /// This member is blocked because the user's own configuration points at
+    /// something unusable. `ModelProvider::infer_typed`'s default maps the
+    /// engine's `Unavailable` onto a provider error with no HTTP status, which
+    /// the failover rule reads as transient - so without this the chain would
+    /// step past the blocked slot and let the fallback answer, which is the exact
+    /// silent switch the block exists to prevent.
+    async fn infer_typed(
+        &self,
+        _: ContextBundle,
+        _: Option<assistant_contracts::ProviderEventSink>,
+    ) -> std::result::Result<AgentAction, assistant_contracts::NormalizedError> {
+        Err(match self.error.clone() {
+            // A provider the chain names that is not configured the way the chain
+            // says. Not a fault that passing time will fix.
+            Error::Unavailable => assistant_contracts::NormalizedError::EndpointNotFound,
+            other => assistant_contracts::normalized_from_engine(other),
+        })
+    }
 }
 
 #[async_trait::async_trait]

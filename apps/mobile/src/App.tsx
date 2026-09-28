@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowUp,
@@ -9,32 +9,107 @@ import {
   X,
 } from "lucide-react";
 import { command } from "./service";
-import type {
-  RunEventEnvelope,
-  RunEventPage,
-  Snapshot,
-  Task,
-} from "./types";
+import type { RunEventEnvelope, RunEventPage, Snapshot, Task } from "./types";
 import { TaskView } from "./TaskView";
 import { Configuration } from "./Configuration";
 
 type View = "assistant" | "activity" | "connections" | "settings";
+type BridgeState = "connecting" | "online" | "degraded" | "offline";
+type SendState = "idle" | "sending" | "accepted";
+
+const SNAPSHOT_TIMEOUT_MS = 8000;
+const COLD_START_TIMEOUT_MS = 25000;
+const COLD_START_ATTEMPTS = 3;
+
+function errorText(error: unknown, fallback: string): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return fallback;
+}
+
+function getOrCreateConversationId(): string {
+  const key = "athera.active_conversation_id";
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored) return stored;
+    const created = crypto.randomUUID();
+    window.localStorage.setItem(key, created);
+    return created;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+
+function getStoredDraft(): string {
+  try {
+    return window.localStorage.getItem("athera.composer_draft") ?? "";
+  } catch {
+    return "";
+  }
+}
 export default function App() {
   const [view, setView] = useState<View>("assistant");
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const snapshotRef = useRef<Snapshot | null>(null);
+  const refreshInFlight = useRef(false);
+  const eventPollInFlight = useRef(false);
+  const consecutiveFailures = useRef(0);
+  const [bridgeState, setBridgeState] = useState<BridgeState>("connecting");
   const [error, setError] = useState("");
-  const [actionDraft, setActionDraft] = useState("");
+  const [eventError, setEventError] = useState("");
+  const [actionDraft, setActionDraft] = useState(getStoredDraft);
   const [sendingAction, setSendingAction] = useState(false);
-  const [conversation] = useState(() => crypto.randomUUID());
+  const [sendState, setSendState] = useState<SendState>("idle");
+  const [conversation, setConversation] = useState(() =>
+    getOrCreateConversationId(),
+  );
   const [selected, setSelected] = useState<string | null>(null);
   const [runEvents, setRunEvents] = useState<RunEventEnvelope[]>([]);
-  const refresh = useCallback(async () => {
+  useEffect(() => {
     try {
-      setSnapshot(await command<Snapshot>("snapshot"));
+      if (actionDraft) {
+        window.localStorage.setItem("athera.composer_draft", actionDraft);
+      } else {
+        window.localStorage.removeItem("athera.composer_draft");
+      }
     } catch {
-      setError(
-        "Cannot reach the assistant. Check that it is running, then retry.",
+      return;
+    }
+  }, [actionDraft]);
+  const refresh = useCallback(async (showError = true) => {
+    if (refreshInFlight.current) return false;
+    refreshInFlight.current = true;
+    const coldStart = snapshotRef.current === null;
+    try {
+      const next = await command<Snapshot>(
+        "snapshot",
+        {},
+        { timeoutMs: coldStart ? COLD_START_TIMEOUT_MS : SNAPSHOT_TIMEOUT_MS },
       );
+      snapshotRef.current = next;
+      setSnapshot(next);
+      setBridgeState("online");
+      consecutiveFailures.current = 0;
+      if (showError) setError("");
+      return true;
+    } catch (e) {
+      consecutiveFailures.current += 1;
+      if (coldStart && consecutiveFailures.current < COLD_START_ATTEMPTS) {
+        setBridgeState("connecting");
+        return false;
+      }
+      setBridgeState(snapshotRef.current ? "degraded" : "offline");
+      if (showError) {
+        setError(
+          errorText(
+            e,
+            "Cannot reach the assistant. Check that it is running, then retry.",
+          ),
+        );
+      }
+      return false;
+    } finally {
+      refreshInFlight.current = false;
     }
   }, []);
   useEffect(() => {
@@ -45,14 +120,20 @@ export default function App() {
   useEffect(() => {
     let after = 0;
     const poll = async () => {
+      if (eventPollInFlight.current) return;
+      eventPollInFlight.current = true;
       try {
-        const page = await command<RunEventPage>("run_events", { after });
+        const page = await command<RunEventPage>(
+          "run_events",
+          { after },
+          { timeoutMs: 5000 },
+        );
         if (
           page.schema !== "aethra.run-events.v1" ||
           !Array.isArray(page.events) ||
           !Number.isSafeInteger(page.next_after)
         )
-          return;
+          throw new Error("The assistant returned an invalid event update.");
         after = page.next_after;
         setRunEvents((current) => {
           const retained = page.reset_required ? [] : current;
@@ -64,8 +145,11 @@ export default function App() {
             .sort((left, right) => left.sequence - right.sequence)
             .slice(-500);
         });
-      } catch {
-        // Snapshot polling above owns the user-visible bridge error.
+        setEventError("");
+      } catch (e) {
+        setEventError(errorText(e, "Live updates paused. Retry to reconnect."));
+      } finally {
+        eventPollInFlight.current = false;
       }
     };
     void poll();
@@ -75,39 +159,123 @@ export default function App() {
   async function act(name: string, payload: unknown) {
     setError("");
     try {
-      await command(name, payload);
+      await command(name, payload, { timeoutMs: 15000 });
       await refresh();
       return true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Action failed");
+      setError(errorText(e, "Action failed"));
       return false;
     }
   }
   async function sendAction() {
     if (!actionDraft.trim() || sendingAction) return;
+    const text = actionDraft.trim();
     setSendingAction(true);
+    setSendState("sending");
     setError("");
     try {
-      await command("submit_input", {
-        conversation_id: conversation,
-        text: actionDraft,
-        source: "text",
-      });
+      await command(
+        "submit_input",
+        {
+          conversation_id: conversation,
+          text,
+          source: "text",
+        },
+        { timeoutMs: 10000 },
+      );
       setActionDraft("");
-      await refresh();
+      setSendState("accepted");
+      const refreshed = await refresh(false);
+      if (!refreshed) {
+        setError(
+          "Your request was accepted, but live status is unavailable. Retry to reconnect.",
+        );
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not send request");
+      setSendState("idle");
+      setError(errorText(e, "Could not send request"));
     } finally {
       setSendingAction(false);
     }
   }
-  const tasks =
-    snapshot?.tasks
-      .filter((t) => t.input.conversation_id === conversation)
-      .slice()
-      .reverse() ?? [];
-  const active = snapshot?.tasks.some((t) => t.status === "running");
+  function startNewChat() {
+    const next = crypto.randomUUID();
+    try {
+      window.localStorage.setItem("athera.active_conversation_id", next);
+    } catch {
+      setConversation(next);
+      setActionDraft("");
+      setSendState("idle");
+      setSelected(null);
+      return;
+    }
+    setConversation(next);
+    setActionDraft("");
+    setSendState("idle");
+    setSelected(null);
+  }
+  const tasks = useMemo(
+    () =>
+      snapshot?.tasks
+        .filter((t) => t.input.conversation_id === conversation)
+        .slice()
+        .reverse() ?? [],
+    [conversation, snapshot],
+  );
+  // Display names for the configured chain, so a turn can be attributed to a
+  // vendor the user recognises rather than a slug.
+  const providerLabels = useMemo(
+    () =>
+      Object.fromEntries(
+        (snapshot?.failover?.chain ?? []).map((member) => [
+          member.provider_id,
+          member.display_name,
+        ]),
+      ),
+    [snapshot],
+  );
+  // The provider a turn should have used. Anything else answering means a
+  // fallback happened and must be visible.
+  const primaryProviderId = snapshot?.failover?.chain?.[0]?.provider_id ?? null;
+  const active = tasks.some(
+    (t) => t.status === "running" || t.status === "created",
+  );
+  const setupRequired =
+    snapshot?.cloud_credential === "missing" ||
+    snapshot?.cloud_credential === "not_configured";
+  const connectionLabel =
+    bridgeState === "connecting"
+      ? "Starting"
+      : bridgeState === "offline"
+        ? "Offline"
+        : bridgeState === "degraded"
+          ? "Connection degraded"
+          : active
+            ? "Working"
+            : setupRequired
+              ? "Setup required"
+              : "Ready";
   const selection = snapshot?.tasks.find((t) => t.id === selected);
+  useEffect(() => {
+    if (
+      sendState === "accepted" &&
+      tasks.some((task) =>
+        ["completed", "failed", "cancelled", "waiting_for_auth"].includes(
+          task.status,
+        ),
+      )
+    ) {
+      setSendState("idle");
+    }
+  }, [sendState, tasks]);
+  const scrollerRef = useRef<HTMLElement | null>(null);
+  const newestTaskId = tasks[tasks.length - 1]?.id ?? null;
+  useEffect(() => {
+    if (view !== "assistant" || !newestTaskId) return;
+    const node = scrollerRef.current;
+    if (!node) return;
+    node.scrollTo({ top: node.scrollHeight, behavior: "auto" });
+  }, [view, newestTaskId]);
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -116,18 +284,27 @@ export default function App() {
         </div>
         <div>
           <h1>Athera</h1>
-          <span className="connection-state">
-            <i className={snapshot ? "online" : ""} />
-            {active
-              ? "Working"
-              : snapshot?.cloud_credential === "missing"
-                ? "API key needed"
-                : snapshot?.cloud_credential === "configured"
-                  ? "Ready"
-                  : "Offline"}
+          <span className="connection-state" aria-live="polite">
+            <i
+              className={
+                setupRequired
+                  ? "degraded"
+                  : bridgeState === "online"
+                    ? "online"
+                    : bridgeState === "degraded"
+                      ? "degraded"
+                      : ""
+              }
+            />
+            {connectionLabel}
           </span>
         </div>
         <div className="header-actions">
+          {tasks.length > 0 && (
+            <button className="text-button new-chat" onClick={startNewChat}>
+              New chat
+            </button>
+          )}
           <button
             className="icon-button"
             title="Refresh"
@@ -153,27 +330,76 @@ export default function App() {
           </button>
         </div>
       )}
-      <main>
+      {eventError && !error && (
+        <div role="status" className="status-banner">
+          <span>{eventError}</span>
+          <button className="text-button" onClick={() => void refresh()}>
+            Retry
+          </button>
+        </div>
+      )}
+      <main ref={scrollerRef}>
         {view === "assistant" && (
           <section className="conversation">
             {tasks.length === 0 ? (
-              <div className="empty-conversation">
-                <MessageSquare size={34} />
-                <h2>What would you like me to do?</h2>
-                <p>
-                  Athera interprets your request, uses relevant context, and
-                  acts within explicit authority.
-                </p>
-              </div>
+              bridgeState === "connecting" ? (
+                <div className="empty-conversation" aria-live="polite">
+                  <RefreshCw className="empty-mark" size={28} />
+                  <h2>Starting Athera</h2>
+                  <p>
+                    Loading the assistant, your provider setup, and saved
+                    conversations. This can take a moment on first launch.
+                  </p>
+                </div>
+              ) : bridgeState === "offline" ? (
+                <div className="empty-conversation">
+                  <X className="empty-mark" size={28} />
+                  <h2>Assistant unavailable</h2>
+                  <p>Reconnect to the assistant before sending a request.</p>
+                  <button
+                    className="primary"
+                    onClick={() => void refresh()}
+                    type="button"
+                  >
+                    Try again
+                  </button>
+                </div>
+              ) : setupRequired ? (
+                <div className="empty-conversation">
+                  <SettingsIcon className="empty-mark" size={28} />
+                  <h2>Connect a provider to start</h2>
+                  <p>
+                    Athera needs one working cloud provider before it can answer
+                    conversation requests.
+                  </p>
+                  <button
+                    className="primary"
+                    onClick={() => setView("settings")}
+                    type="button"
+                  >
+                    Configure provider
+                  </button>
+                </div>
+              ) : (
+                <div className="empty-conversation">
+                  <MessageSquare size={34} />
+                  <h2>What would you like me to do?</h2>
+                  <p>
+                    Athera interprets your request, uses relevant context, and
+                    acts within explicit authority.
+                  </p>
+                </div>
+              )
             ) : (
               tasks.map((task) => (
                 <TaskView
                   key={task.id}
                   task={task}
-                  events={runEvents.filter(
-                    (event) => event.run_id === task.id,
-                  )}
+                  events={runEvents.filter((event) => event.run_id === task.id)}
                   act={act}
+                  onOpenSettings={() => setView("settings")}
+                  providerLabels={providerLabels}
+                  fallbackProviderId={primaryProviderId}
                 />
               ))
             )}
@@ -183,7 +409,10 @@ export default function App() {
           <section className="page">
             <h2>Activity</h2>
             {snapshot?.suggestions && snapshot.suggestions.length > 0 && (
-              <section aria-label="Suggested next steps" className="notice-card">
+              <section
+                aria-label="Suggested next steps"
+                className="notice-card"
+              >
                 <h3>Suggested next steps</h3>
                 {snapshot.suggestions.map((suggestion) => (
                   <button
@@ -211,6 +440,9 @@ export default function App() {
                     (event) => event.run_id === selection.id,
                   )}
                   act={act}
+                  onOpenSettings={() => setView("settings")}
+                  providerLabels={providerLabels}
+                  fallbackProviderId={primaryProviderId}
                 />
                 <details>
                   <summary>Task details</summary>
@@ -240,7 +472,8 @@ export default function App() {
                 >
                   <span>{task.input.text}</span>
                   <small>
-                    {label(task.status)} &middot; {task.step} steps
+                    {label(task.status)} &middot; {task.step}{" "}
+                    {task.step === 1 ? "step" : "steps"}
                   </small>
                 </button>
               ))
@@ -280,12 +513,31 @@ export default function App() {
               className="send-button"
               aria-label="Send"
               title="Send"
-              disabled={!actionDraft.trim() || sendingAction || !snapshot}
+              aria-describedby="composer-hint"
+              disabled={
+                !actionDraft.trim() ||
+                sendingAction ||
+                bridgeState !== "online" ||
+                setupRequired
+              }
               type="submit"
             >
               <ArrowUp size={22} />
             </button>
           </div>
+          <p id="composer-hint" className="composer-hint" aria-live="polite">
+            {sendState === "sending"
+              ? "Sending your request…"
+              : sendState === "accepted"
+                ? "Request accepted. Waiting for the assistant…"
+                : setupRequired
+                  ? "Connect a provider to enable conversation."
+                  : bridgeState === "connecting"
+                    ? "Athera is still starting. You can send once it is ready."
+                    : bridgeState !== "online"
+                      ? "Waiting for the assistant to reconnect."
+                      : "Athera will show progress and any required action here."}
+          </p>
         </form>
       )}
       <nav className="bottom-nav" aria-label="Main navigation">

@@ -559,6 +559,15 @@ Completed since the 2026-09-23 audit (all GNU-toolchain verified):
   no native library required).
 
 Still open (device or user input required):
+- Proof-assistant boundary is now explicit in
+  [`ATHERA_PROOF_ASSISTANT_BOUNDARY.md`](./ATHERA_PROOF_ASSISTANT_BOUNDARY.md):
+  normal app only, one configured provider, durable conversation, truthful
+  recovery, and no SMS/external-action scope.
+- Frontend proof slice started: bounded IPC/event polling, first-run setup CTA,
+  persisted conversation/draft, provider loading/validation/edit states, secret
+  reset on auth change, stored-key updates, mobile-safe settings tabs, and
+  human-first approval/recovery presentation. Host-side and Rust proof-path
+  gates remain open.
 - Wire deterministic requirements/routing into the single submit path and let
   Needle produce a normal local response or a typed handoff (helper and
   router are ready; engine suites now executable — schedule behind a

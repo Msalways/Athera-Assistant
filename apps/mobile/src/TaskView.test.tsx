@@ -40,22 +40,72 @@ const task: Task = {
   },
 };
 describe("TaskView", () => {
-  it("offers explicit resume for an authentication pause", () => {
+  it("does not attribute a turn when no fallback chain is active", () => {
     const act = vi.fn().mockResolvedValue(undefined);
+    render(
+      <TaskView
+        task={{ ...task, pending: null, answered_by: null }}
+        act={act}
+      />,
+    );
+    expect(screen.queryByText(/Answered by|Fallback/)).toBeNull();
+  });
+
+  it("names the provider that answered using its display name", () => {
+    const act = vi.fn().mockResolvedValue(undefined);
+    render(
+      <TaskView
+        task={{ ...task, pending: null, answered_by: "nvidia-nim" }}
+        act={act}
+        providerLabels={{ "nvidia-nim": "NVIDIA NIM" }}
+        fallbackProviderId="nvidia-nim"
+      />,
+    );
+    expect(screen.getByText("NVIDIA NIM")).toBeTruthy();
+  });
+
+  it("marks a fallback turn as coming from a different provider", () => {
+    const act = vi.fn().mockResolvedValue(undefined);
+    render(
+      <TaskView
+        task={{ ...task, pending: null, answered_by: "openai-compatible" }}
+        act={act}
+        providerLabels={{ "openai-compatible": "OpenAI-Compatible (Custom)" }}
+        fallbackProviderId="nvidia-nim"
+      />,
+    );
+    const badge = screen.getByText(/Fallback · OpenAI-Compatible/);
+    expect(badge).toBeTruthy();
+    expect(
+      badge.getAttribute("title") ??
+        badge.closest("span")?.getAttribute("title") ??
+        "",
+    ).toMatch(/primary provider could not answer/i);
+  });
+
+  it("offers explicit resume and direct connection recovery for an authentication pause", () => {
+    const act = vi.fn().mockResolvedValue(undefined);
+    const onOpenSettings = vi.fn();
     render(
       <TaskView
         task={{ ...task, status: "waiting_for_auth", pending: null }}
         act={act}
+        onOpenSettings={onOpenSettings}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Open connections" }));
+    expect(onOpenSettings).toHaveBeenCalledOnce();
     fireEvent.click(
       screen.getByRole("button", { name: "Retry after connecting" }),
     );
     expect(act).toHaveBeenCalledWith("resume_auth", { task_id: task.id });
   });
-  it("shows exact action and submits its approval ID", () => {
+  it("keeps raw approval arguments behind technical details", () => {
     const act = vi.fn().mockResolvedValue(undefined);
     render(<TaskView task={task} act={act} />);
+    expect(screen.getByText("Technical details")).toBeVisible();
+    expect(screen.getByText("person@example.com")).not.toBeVisible();
+    fireEvent.click(screen.getByText("Technical details"));
     expect(screen.getByText("person@example.com")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Approve Send email" }));
     expect(act).toHaveBeenCalledWith("resolve_approval", {
@@ -207,6 +257,8 @@ describe("TaskView", () => {
       "href",
       "https://example.com/fact",
     );
+    expect(screen.getByText("Source details")).toBeVisible();
+    fireEvent.click(screen.getByText("Source details"));
     expect(screen.getByText("[source:source-1]")).toBeVisible();
     expect(screen.getByText("Some search results were omitted.")).toBeVisible();
     expect(

@@ -122,8 +122,13 @@ fn merge_tool_delta(
     arguments_delta: &str,
 ) {
     let key = id.clone().unwrap_or_default();
+    // Providers stream a tool call as: id and name first, then argument
+    // fragments that carry no id. Those fragments belong to the call in
+    // progress, so an id-less delta continues the most recent one. Starting a
+    // second call instead would split one request into two and make the whole
+    // response look invalid.
     let existing = if key.is_empty() {
-        tool_calls.last_mut().filter(|call| call.id.is_empty())
+        tool_calls.last_mut()
     } else {
         tool_calls.iter_mut().find(|call| call.id == key)
     };
@@ -146,25 +151,35 @@ fn merge_tool_delta(
 fn finalize_tool_calls(
     pending: Vec<PendingToolCall>,
 ) -> Result<Vec<ToolCallRequest>, RigAdapterError> {
-    pending
-        .into_iter()
-        .map(|call| {
-            let arguments = if call.arguments.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::from_str(&call.arguments).map_err(|_| {
-                    RigAdapterError::Normalized(NormalizedError::InvalidResponse {
-                        detail: format!("tool call {} has malformed arguments", call.id),
-                    })
-                })?
-            };
-            Ok(ToolCallRequest {
-                id: call.id,
-                name: call.name,
-                arguments,
-            })
-        })
-        .collect()
+    let mut calls: Vec<ToolCallRequest> = Vec::new();
+    for call in pending {
+        let arguments = if call.arguments.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&call.arguments).map_err(|_| {
+                RigAdapterError::Normalized(NormalizedError::InvalidResponse {
+                    detail: format!("tool call {} has malformed arguments", call.id),
+                })
+            })?
+        };
+        // One logical call can arrive twice: a provider's stream may yield a
+        // complete tool call and then the same call again as deltas, each with
+        // its own identifier. Keeping both would present the engine with two
+        // calls where there is one, and the response would be rejected as
+        // invalid. An identical call is the same request, so keep the first.
+        if calls
+            .iter()
+            .any(|existing| existing.name == call.name && existing.arguments == arguments)
+        {
+            continue;
+        }
+        calls.push(ToolCallRequest {
+            id: call.id,
+            name: call.name,
+            arguments,
+        });
+    }
+    Ok(calls)
 }
 
 fn map_stream_item(
@@ -377,7 +392,9 @@ fn map_status(status: u16, retry_after_secs: Option<u64>, detail: String) -> Nor
     match status {
         401 => NormalizedError::AuthenticationFailed,
         403 => NormalizedError::AuthorizationDenied,
-        404 => NormalizedError::ModelNotFound,
+        // Providers answer 404 for an unknown model and 410 Gone for one that
+        // has been retired. Both mean the caller must choose a different model.
+        404 | 410 => NormalizedError::ModelNotFound,
         429 => NormalizedError::RateLimited { retry_after_secs },
         500..=599 => NormalizedError::ProviderError { status, detail },
         _ => NormalizedError::ProviderError { status, detail },
@@ -453,6 +470,135 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_streamed_across_several_deltas_stays_one_call() {
+        // How real providers stream: the id and name arrive first, then the
+        // arguments in further deltas that carry no id of their own.
+        let mut pending: Vec<PendingToolCall> = Vec::new();
+        merge_tool_delta(
+            &mut pending,
+            &Some("call_1".into()),
+            &Some("tool_0".into()),
+            "",
+        );
+        merge_tool_delta(&mut pending, &Some("call_1".into()), &None, "{\"to\":");
+        merge_tool_delta(&mut pending, &None, &None, "\"person@example.com\"}");
+
+        let calls = finalize_tool_calls(pending).unwrap();
+        assert_eq!(calls.len(), 1, "one streamed call must not split into two");
+        assert_eq!(calls[0].name, "tool_0");
+        assert_eq!(calls[0].arguments["to"], "person@example.com");
+    }
+
+    #[test]
+    fn separate_tool_calls_stay_separate() {
+        let mut pending: Vec<PendingToolCall> = Vec::new();
+        merge_tool_delta(
+            &mut pending,
+            &Some("call_1".into()),
+            &Some("tool_0".into()),
+            "{\"a\":",
+        );
+        merge_tool_delta(&mut pending, &None, &None, "1}");
+        merge_tool_delta(
+            &mut pending,
+            &Some("call_2".into()),
+            &Some("tool_1".into()),
+            "{\"b\":",
+        );
+        merge_tool_delta(&mut pending, &None, &None, "2}");
+
+        let calls = finalize_tool_calls(pending).unwrap();
+        assert_eq!(calls.len(), 2, "a new id starts a new call");
+        assert_eq!(calls[0].name, "tool_0");
+        assert_eq!(calls[1].name, "tool_1");
+        assert_eq!(calls[0].arguments["a"], 1);
+        assert_eq!(calls[1].arguments["b"], 2);
+    }
+
+    #[test]
+    fn a_tool_call_with_no_arguments_is_still_usable() {
+        let mut pending: Vec<PendingToolCall> = Vec::new();
+        merge_tool_delta(
+            &mut pending,
+            &Some("call_1".into()),
+            &Some("tool_0".into()),
+            "",
+        );
+        let calls = finalize_tool_calls(pending).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn malformed_streamed_arguments_are_rejected_not_guessed() {
+        let mut pending: Vec<PendingToolCall> = Vec::new();
+        merge_tool_delta(
+            &mut pending,
+            &Some("call_1".into()),
+            &Some("tool_0".into()),
+            "{\"a\":",
+        );
+        assert!(finalize_tool_calls(pending).is_err());
+    }
+
+    #[test]
+    fn a_call_yielded_as_a_complete_item_and_again_as_deltas_is_one_call() {
+        // Observed from a real OpenAI-compatible stream: the same logical call
+        // arrives first as a complete tool call with a generated id, then again
+        // as name/argument deltas under the provider's own id. Both are kept
+        // here to mirror the stream, and the duplicate must collapse to one.
+        let mut pending: Vec<PendingToolCall> = Vec::new();
+        merge_tool_delta(
+            &mut pending,
+            &Some("generated-id".into()),
+            &Some("tool_0".into()),
+            r#"{"to":"person@example.com"}"#,
+        );
+        merge_tool_delta(
+            &mut pending,
+            &Some("provider-id".into()),
+            &Some("tool_0".into()),
+            "",
+        );
+        merge_tool_delta(
+            &mut pending,
+            &Some("provider-id".into()),
+            &None,
+            r#"{"to":"person@example.com"}"#,
+        );
+
+        let calls = finalize_tool_calls(pending).unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one tool call must never be presented to the engine as two"
+        );
+        assert_eq!(calls[0].name, "tool_0");
+        assert_eq!(calls[0].arguments["to"], "person@example.com");
+    }
+
+    #[test]
+    fn the_same_tool_called_with_different_arguments_is_kept_twice() {
+        let mut pending: Vec<PendingToolCall> = Vec::new();
+        merge_tool_delta(
+            &mut pending,
+            &Some("a".into()),
+            &Some("tool_0".into()),
+            r#"{"x":1}"#,
+        );
+        merge_tool_delta(
+            &mut pending,
+            &Some("b".into()),
+            &Some("tool_0".into()),
+            r#"{"x":2}"#,
+        );
+        let calls = finalize_tool_calls(pending).unwrap();
+        assert_eq!(calls.len(), 2, "different arguments are different calls");
+        assert_eq!(calls[0].arguments["x"], 1);
+        assert_eq!(calls[1].arguments["x"], 2);
+    }
+
+    #[test]
     fn response_maps_text_usage_and_model() {
         let response = to_model_response("custom-model", rig_response());
         assert_eq!(response.content, "hello");
@@ -478,6 +624,14 @@ mod tests {
             NormalizedError::RateLimited {
                 retry_after_secs: Some(60)
             }
+        );
+    }
+
+    #[test]
+    fn retired_models_410_map_to_model_not_found() {
+        assert_eq!(
+            map_status(410, None, String::new()),
+            NormalizedError::ModelNotFound
         );
     }
 

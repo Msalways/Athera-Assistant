@@ -37,6 +37,17 @@ pub enum ProviderTransport {
     },
 }
 
+impl ProviderTransport {
+    pub fn model(&self) -> &str {
+        match self {
+            Self::OpenAi { model, .. }
+            | Self::Anthropic { model, .. }
+            | Self::Gemini { model, .. } => model,
+            Self::Azure { deployment, .. } => deployment,
+        }
+    }
+}
+
 pub fn build_transport(
     definition: &ProviderDefinition,
     option: &AuthOptionSpec,

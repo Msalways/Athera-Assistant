@@ -72,7 +72,19 @@ const catalog = {
         vision: true,
         max_context_tokens: 128000,
       },
-      endpoint_fields: [],
+      endpoint_fields: [
+        {
+          id: "base_url",
+          label: "Base URL",
+          kind: "url",
+          required: false,
+          secret: false,
+          validation: null,
+          options: [],
+          visible_when: [],
+          help_text: "Defaults to the catalog endpoint",
+        },
+      ],
       model_source: "catalog",
       auth_options: [
         {
@@ -124,7 +136,7 @@ it("renders catalog providers and saves a masked key through the profile command
     expect(saveProviderProfile).toHaveBeenCalledWith({
       provider_id: "openai",
       auth_option_id: "api_key",
-      values: {},
+      values: { base_url: "https://api.openai.com/v1" },
       secrets: { api_key: "fixture-not-real-key" },
     }),
   );
@@ -134,9 +146,7 @@ it("renders catalog providers and saves a masked key through the profile command
 it("keeps the entered key when the backend rejects the profile", async () => {
   mockCatalog();
   vi.mocked(saveProviderProfile).mockRejectedValue(new Error("rejected"));
-  render(
-    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
-  );
+  render(<Configuration snapshot={snapshot} view="settings" act={vi.fn()} />);
   const field = await screen.findByLabelText("API Key");
   fireEvent.change(field, { target: { value: "fixture-not-real-key" } });
   fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
@@ -162,12 +172,13 @@ it("lists saved profiles with key state and removes them", async () => {
       active: true,
     },
   ]);
-  render(
-    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
-  );
+  render(<Configuration snapshot={snapshot} view="settings" act={vi.fn()} />);
   expect(await screen.findByText("Key stored")).toBeVisible();
   expect(screen.getByText("Active")).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Remove OpenAI" }));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Confirm removal of OpenAI" }),
+  );
   await waitFor(() =>
     expect(deleteProviderProfile).toHaveBeenCalledWith("openai"),
   );
@@ -198,9 +209,7 @@ it("tests a saved profile connection and shows the typed outcome", async () => {
     latency_ms: null,
     message: "Authentication was rejected. Check the API key.",
   });
-  render(
-    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
-  );
+  render(<Configuration snapshot={snapshot} view="settings" act={vi.fn()} />);
   expect(await screen.findByText("Key stored")).toBeVisible();
   fireEvent.click(
     screen.getByRole("button", { name: "Test OpenAI connection" }),
@@ -231,19 +240,38 @@ it("marks a profile active for inference", async () => {
       active: false,
     },
   ]);
-  render(
-    <Configuration snapshot={snapshot} view="settings" act={vi.fn()} />,
-  );
+  render(<Configuration snapshot={snapshot} view="settings" act={vi.fn()} />);
   expect(await screen.findByText("Key stored")).toBeVisible();
   fireEvent.click(
     screen.getByRole("button", { name: "Use OpenAI for inference" }),
   );
-  await waitFor(() =>
-    expect(setActiveProvider).toHaveBeenCalledWith("openai"),
+  await waitFor(() => expect(setActiveProvider).toHaveBeenCalledWith("openai"));
+  expect(await screen.findByText("Active provider updated.")).toBeVisible();
+});
+
+it("loads an inactive profile for editing without replacing the active one", async () => {
+  mockCatalog();
+  vi.mocked(listProviderProfiles).mockResolvedValue([
+    {
+      profile: {
+        schema: "aethra.provider-profile.v1",
+        provider_id: "openai",
+        auth_option_id: "api_key",
+        non_secret_config: { base_url: "https://saved.example.com/v1" },
+        enabled: true,
+        display_name: "OpenAI",
+        created_at: 1,
+        updated_at: 1,
+      },
+      key_configured: true,
+      active: false,
+    },
+  ]);
+  render(<Configuration snapshot={snapshot} view="settings" act={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit OpenAI" }));
+  expect(await screen.findByLabelText("Base URL")).toHaveValue(
+    "https://saved.example.com/v1",
   );
-  expect(
-    await screen.findByText("Active provider updated."),
-  ).toBeVisible();
 });
 
 it("connects the reviewed anonymous Parallel Search preset", async () => {
@@ -464,6 +492,11 @@ it("shows byte progress and cancels a user-started model setup", async () => {
     return {};
   });
   render(<Configuration snapshot={snapshot} view="settings" act={vi.fn()} />);
+  fireEvent.click(
+    screen.getByText("Optional offline conversation model", {
+      selector: "summary",
+    }),
+  );
   expect(await screen.findByLabelText("Model download progress")).toHaveValue(
     50,
   );

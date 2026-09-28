@@ -7,15 +7,22 @@ import type {
   Task,
 } from "./types";
 import { label } from "./App";
+import { Markdown } from "./Markdown";
 import { PreferenceFeedback } from "./PreferenceFeedback";
 export function TaskView({
   task,
   events = [],
   act,
+  onOpenSettings,
+  providerLabels,
+  fallbackProviderId,
 }: {
   task: Task;
   events?: RunEventEnvelope[];
   act: (name: string, payload: unknown) => Promise<unknown>;
+  onOpenSettings?: () => void;
+  providerLabels?: Record<string, string>;
+  fallbackProviderId?: string | null;
 }) {
   const [answer, setAnswer] = useState("");
   const [busy, setBusy] = useState(false);
@@ -34,6 +41,19 @@ export function TaskView({
     .map((event) => event.text_delta ?? "")
     .join("");
   const workers = workerActivity(events);
+  const showMessage =
+    task.message.trim().length > 0 &&
+    task.message.trim().toLowerCase() !== label(task.status).toLowerCase();
+  // Only shown when a fallback chain is active, so an ordinary single-provider
+  // reply is not decorated. When the answer came from the fallback, it says so.
+  const answeredBy = task.answered_by ?? null;
+  const usedFallback =
+    Boolean(answeredBy) &&
+    Boolean(fallbackProviderId) &&
+    answeredBy !== fallbackProviderId;
+  const answeredByName = answeredBy
+    ? (providerLabels?.[answeredBy] ?? answeredBy)
+    : null;
   return (
     <article className="task">
       <div className="user-message">{task.input.text}</div>
@@ -49,6 +69,20 @@ export function TaskView({
           )}{" "}
           {label(task.status)}
         </span>
+        {answeredByName && (
+          <span
+            className={`provider-badge${usedFallback ? " fallback" : ""}`}
+            title={
+              usedFallback
+                ? `The primary provider could not answer, so ${answeredByName} did.`
+                : `Answered by ${answeredByName}.`
+            }
+          >
+            {usedFallback ? <RefreshCw size={12} aria-hidden /> : null}
+            {usedFallback ? "Fallback · " : ""}
+            {answeredByName}
+          </span>
+        )}
         {active && (
           <button
             className="icon-button"
@@ -67,7 +101,7 @@ export function TaskView({
           {streamedText}
         </p>
       ) : (
-        task.message && <p className="assistant-message">{task.message}</p>
+        showMessage && <p className="assistant-message">{task.message}</p>
       )}
       {task.status === "completed" && (
         <PreferenceFeedback
@@ -84,8 +118,11 @@ export function TaskView({
       {events.length > 0 && (
         <details className="execution-events">
           <summary>
-            Execution · {events.length} events
-            {workers.length > 0 ? ` · ${workers.length} workers` : ""}
+            Execution · {events.length}{" "}
+            {events.length === 1 ? "event" : "events"}
+            {workers.length > 0
+              ? ` · ${workers.length} ${workers.length === 1 ? "worker" : "workers"}`
+              : ""}
           </summary>
           {workers.length > 0 && (
             <ul className="worker-activity" aria-label="Worker activity">
@@ -113,18 +150,24 @@ export function TaskView({
       {task.status === "waiting_for_approval" && pending && (
         <section className="approval" aria-label="Review action">
           <h3>{pending.spec.name}</h3>
-          <dl>
-            {Object.entries(pending.call.arguments).map(([key, value]) => (
-              <div key={key}>
-                <dt>{key}</dt>
-                <dd>
-                  {typeof value === "string"
-                    ? value
-                    : JSON.stringify(value, null, 2)}
-                </dd>
-              </div>
-            ))}
-          </dl>
+          <p className="approval-summary">
+            Review what this action will change before you continue.
+          </p>
+          <details>
+            <summary>Technical details</summary>
+            <dl>
+              {Object.entries(pending.call.arguments).map(([key, value]) => (
+                <div key={key}>
+                  <dt>{key}</dt>
+                  <dd>
+                    {typeof value === "string"
+                      ? value
+                      : JSON.stringify(value, null, 2)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </details>
           <div className="button-row">
             <button
               className="secondary"
@@ -193,6 +236,11 @@ export function TaskView({
             Connect the requested service, then retry this same task. No action
             will be replayed while authorization is incomplete.
           </p>
+          {onOpenSettings && (
+            <button className="primary" type="button" onClick={onOpenSettings}>
+              Open connections
+            </button>
+          )}
           <button
             className="secondary"
             disabled={busy}
@@ -211,11 +259,7 @@ function OutputView({ output }: { output: AssistantOutput }) {
     <section className="assistant-output" aria-label="Assistant result">
       {output.blocks.map((block) => {
         if (block.type === "markdown")
-          return (
-            <p className="output-markdown" key={block.id}>
-              {block.markdown}
-            </p>
-          );
+          return <Markdown key={block.id} text={block.markdown} />;
         if (block.type === "list") {
           const List = block.ordered ? "ol" : "ul";
           return (
@@ -249,11 +293,14 @@ function OutputView({ output }: { output: AssistantOutput }) {
               {block.sources.map((source) => (
                 <article className="source-card" key={source.id}>
                   <h4>{source.title}</h4>
-                  <small>[source:{source.id}]</small>
                   <a href={source.url} target="_blank" rel="noreferrer">
                     Open source
                   </a>
                   <p>{source.excerpt}</p>
+                  <details>
+                    <summary>Source details</summary>
+                    <small>[source:{source.id}]</small>
+                  </details>
                 </article>
               ))}
             </section>

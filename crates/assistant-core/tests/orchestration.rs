@@ -154,6 +154,85 @@ async fn provider_deltas_and_worker_lifecycle_are_ordered_before_the_terminal_ev
     assert!(events[2..=5].iter().all(|event| event.worker_id == worker));
 }
 
+/// Announces which provider is answering, then streams text. This is what a
+/// failover chain does, so the turn can be attributed to the vendor that
+/// actually produced it.
+struct AttributingProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for AttributingProvider {
+    fn id(&self) -> &str {
+        "attributing-fixture"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    async fn infer(&self, _: ContextBundle) -> Result<AgentAction> {
+        unreachable!()
+    }
+
+    async fn infer_stream(&self, _: ContextBundle, sink: ProviderEventSink) -> Result<AgentAction> {
+        sink(ProviderEvent::ProviderSelected {
+            provider_id: "fallback-vendor".into(),
+        })?;
+        sink(ProviderEvent::TextDelta {
+            text: "Answered".into(),
+        })?;
+        Ok(respond())
+    }
+}
+
+#[tokio::test]
+async fn a_turn_records_the_provider_that_answered_it() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let provider = Arc::new(AttributingProvider);
+    let assistant = Assistant::new(
+        store.clone(),
+        provider.clone(),
+        provider,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let completed = assistant.run(task.id).await.unwrap();
+    assert_eq!(completed.status, TaskStatus::Completed);
+    // Attribution lives on the task, not in a process-wide "last answered"
+    // value, so concurrent turns cannot misreport each other.
+    assert_eq!(
+        completed.answered_by.as_deref(),
+        Some("fallback-vendor"),
+        "the answering provider must be recorded on the turn"
+    );
+    assert_eq!(
+        store.task(task.id).unwrap().answered_by.as_deref(),
+        Some("fallback-vendor"),
+        "attribution must persist"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_without_a_provider_selection_is_left_unattributed() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let provider = Arc::new(StreamingProvider);
+    let assistant = Assistant::new(
+        store.clone(),
+        provider.clone(),
+        provider,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let completed = assistant.run(task.id).await.unwrap();
+    // A single provider that never announces itself must not be given a label.
+    assert_eq!(completed.answered_by, None);
+}
+
 #[tokio::test]
 async fn deltas_arriving_after_a_worker_finishes_are_discarded() {
     let store = Arc::new(SqliteStore::memory().unwrap());
@@ -542,6 +621,109 @@ async fn approval_survives_restart_and_runs_once() {
     assert_eq!(
         second.approve(task.id, approval, true).unwrap_err(),
         Error::Conflict
+    );
+}
+
+/// Fails the way a tool whose connection is not configured does.
+struct UnavailableExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for UnavailableExecutor {
+    async fn execute(&self, _: &ToolSpec, _: &ToolCall) -> Result<serde_json::Value> {
+        Err(Error::Unavailable)
+    }
+}
+
+/// A cloud provider that is simply not reachable.
+struct UnreachableProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for UnreachableProvider {
+    fn id(&self) -> &str {
+        "unreachable-fixture"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            planning: true,
+            local: false,
+        }
+    }
+
+    async fn infer(&self, _: ContextBundle) -> Result<AgentAction> {
+        Err(Error::Unavailable)
+    }
+
+    async fn infer_stream(&self, _: ContextBundle, _: ProviderEventSink) -> Result<AgentAction> {
+        Err(Error::Unavailable)
+    }
+}
+
+#[tokio::test]
+async fn an_unreachable_model_is_not_reported_as_a_settings_problem() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::new(true, vec![call()])),
+        Arc::new(UnreachableProvider),
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let done = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(done.status, TaskStatus::Failed);
+    let message = done.message.to_lowercase();
+    assert!(
+        !message.contains("provider settings"),
+        "a dropped connection is not something the user can fix in settings: {}",
+        done.message
+    );
+    assert!(
+        message.contains("not reachable") || message.contains("no reasoning model"),
+        "the message must name the real cause: {}",
+        done.message
+    );
+    match store.task_blocker(task.id).unwrap() {
+        Some(TaskBlocker::ReasoningUnavailable { .. }) => {}
+        other => panic!("expected an unreachable-reasoning blocker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_tool_that_cannot_run_is_not_blamed_on_the_cloud_model() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    registry::register(
+        store.as_ref(),
+        &Capability::Tool(example_tool(Risk::ExternalWrite)),
+    )
+    .unwrap();
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::new(true, vec![call()])),
+        Arc::new(ScriptedProvider::new(false, vec![respond()])),
+        Arc::new(UnavailableExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let waiting = assistant.run(task.id).await.unwrap();
+    assert_eq!(waiting.status, TaskStatus::WaitingForApproval);
+    let approval = waiting.pending.unwrap().id;
+    assistant.approve(task.id, approval, true).unwrap();
+    let done = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(done.status, TaskStatus::Failed);
+    let message = done.message.to_lowercase();
+    assert!(
+        !message.contains("cloud model"),
+        "a tool fault must not be reported as a cloud model fault: {}",
+        done.message
+    );
+    assert!(
+        message.contains("connection"),
+        "the message must point at the connection the tool needs: {}",
+        done.message
     );
 }
 

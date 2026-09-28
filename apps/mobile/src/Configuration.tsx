@@ -13,6 +13,8 @@ import type {
   BuildInfo,
   Capability,
   ConnectionState,
+  FailoverMember,
+  LocalShadowState,
   OAuthAuthorizationStart,
   OAuthAuthorizationPoll,
   ProviderProfileDraft,
@@ -34,6 +36,7 @@ import {
 import type { ConnectionTestOutcome } from "./service";
 import { AdaptiveRulesSettings } from "./AdaptiveRules";
 import { ProviderCatalogSettings } from "./ProviderCatalogSettings";
+import { FailoverSettings } from "./FailoverSettings";
 
 type Act = (name: string, payload: unknown) => Promise<boolean>;
 export function Configuration({
@@ -494,79 +497,95 @@ export function Configuration({
   return (
     <section className="page">
       <h2>Settings</h2>
-      <div className="tabs" role="tablist" aria-label="Settings sections">
-        {["models", "memory", "rules", "tools", "skills", "diagnostics"].map((t) => (
-          <button
-            key={t}
-            role="tab"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-          >
-            {t[0].toUpperCase() + t.slice(1)}
-          </button>
-        ))}
-      </div>
-      {tab === "models" ? (
-        <ModelSettings needle={snapshot.needle} />
-      ) : tab === "memory" ? (
-        <MemorySettings />
-      ) : tab === "rules" ? (
-        <AdaptiveRulesSettings
-          proposals={snapshot.rule_proposals ?? []}
-          rules={snapshot.adaptive_rules ?? []}
-        />
-      ) : tab === "diagnostics" ? (
-        <DiagnosticsTab snapshot={snapshot} />
-      ) : (
-        <>
-          <div className="search-row">
-            <Search size={18} />
-            <input
-              aria-label={`Search ${tab}`}
-              placeholder={`Search ${tab}`}
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-            <select
-              aria-label="Filter capabilities"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-            >
-              <option value="all">All</option>
-              <option value="enabled">Enabled</option>
-            </select>
-          </div>
-          {entries.length === 0 && (
-            <p className="empty-state">No {tab} found.</p>
-          )}
-          {entries.map((entry) => (
-            <CapabilityRow key={entry.spec.id} entry={entry} act={act} />
-          ))}
-          {tab === "skills" && (
-            <div className="settings-form">
-              <h3>Import skill</h3>
-              <label>
-                Skill manifest
-                <textarea
-                  rows={7}
-                  value={importText}
-                  onChange={(e) => setImportText(e.target.value)}
-                  maxLength={20000}
-                />
-              </label>
-              {importError && <p role="alert">{importError}</p>}
+      <div className="tab-strip-wrap">
+        <div className="tabs" role="tablist" aria-label="Settings sections">
+          {["models", "memory", "rules", "tools", "skills", "diagnostics"].map(
+            (t) => (
               <button
-                className="primary"
-                disabled={!importText || busy}
-                onClick={() => void importSkill()}
+                key={t}
+                id={`settings-tab-${t}`}
+                role="tab"
+                aria-controls={`settings-panel-${t}`}
+                aria-selected={tab === t}
+                tabIndex={tab === t ? 0 : -1}
+                onClick={() => setTab(t)}
               >
-                <Download size={17} />
-                Import
+                {t[0].toUpperCase() + t.slice(1)}
               </button>
-            </div>
+            ),
           )}
-        </>
-      )}
+        </div>
+      </div>
+      <div
+        id={`settings-panel-${tab}`}
+        role="tabpanel"
+        aria-labelledby={`settings-tab-${tab}`}
+      >
+        {tab === "models" ? (
+          <ModelSettings
+            needle={snapshot.needle}
+            failoverChain={snapshot.failover?.chain}
+          />
+        ) : tab === "memory" ? (
+          <MemorySettings />
+        ) : tab === "rules" ? (
+          <AdaptiveRulesSettings
+            proposals={snapshot.rule_proposals ?? []}
+            rules={snapshot.adaptive_rules ?? []}
+          />
+        ) : tab === "diagnostics" ? (
+          <DiagnosticsTab snapshot={snapshot} />
+        ) : (
+          <>
+            <div className="search-row">
+              <Search size={18} />
+              <input
+                aria-label={`Search ${tab}`}
+                placeholder={`Search ${tab}`}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              <select
+                aria-label="Filter capabilities"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              >
+                <option value="all">All</option>
+                <option value="enabled">Enabled</option>
+              </select>
+            </div>
+            {entries.length === 0 && (
+              <p className="empty-state">No {tab} found.</p>
+            )}
+            {entries.map((entry) => (
+              <CapabilityRow key={entry.spec.id} entry={entry} act={act} />
+            ))}
+            {tab === "skills" && (
+              <div className="settings-form">
+                <h3>Import skill</h3>
+                <label>
+                  Skill manifest
+                  <textarea
+                    rows={7}
+                    value={importText}
+                    onChange={(e) => setImportText(e.target.value)}
+                    maxLength={20000}
+                  />
+                </label>
+                {importError && <p role="alert">{importError}</p>}
+                <button
+                  className="primary"
+                  disabled={!importText || busy}
+                  onClick={() => void importSkill()}
+                >
+                  <Download size={17} />
+                  Import
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </section>
   );
 }
@@ -645,34 +664,52 @@ function CapabilityRow({ entry, act }: { entry: Capability; act: Act }) {
     </div>
   );
 }
-function ModelSettings({ needle }: { needle: string }) {
+function ModelSettings({
+  needle,
+  failoverChain = [],
+}: {
+  needle: string;
+  failoverChain?: FailoverMember[];
+}) {
   return (
     <>
-      <LocalModelSettings />
+      <ProviderProfilesSection failoverChain={failoverChain} />
       <div className="model-status">
         <div>
-          <h3>Needle 2</h3>
-          <small>Local tool decisions</small>
+          <h3>Bundled on-device model</h3>
+          <small>Answers tool decisions on this device</small>
         </div>
-        <span className="badge amber">
-          {needle === "ready" ? "Ready" : "Not linked"}
+        <span className={`badge ${needle === "ready" ? "green" : "amber"}`}>
+          {needle === "ready" ? "Linked" : "Not linked"}
         </span>
       </div>
-      <ProviderProfilesSection />
+      <details className="advanced-model">
+        <summary>Optional offline conversation model</summary>
+        <LocalModelSettings />
+      </details>
     </>
   );
 }
 
-function ProviderProfilesSection() {
+function ProviderProfilesSection({
+  failoverChain = [],
+}: {
+  failoverChain?: FailoverMember[];
+}) {
   const [profiles, setProfiles] = useState<SavedProviderProfile[]>([]);
+  const [profilesLoaded, setProfilesLoaded] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const refresh = async () => {
     try {
       setProfiles(await listProviderProfiles());
+      setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load providers");
+    } finally {
+      setProfilesLoaded(true);
     }
   };
   useEffect(() => {
@@ -684,10 +721,12 @@ function ProviderProfilesSection() {
     setError("");
     try {
       await saveProviderProfile(draft);
-      setStatus("Provider saved.");
+      setEditingId(draft.provider_id);
       await refresh();
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not save provider");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -697,6 +736,7 @@ function ProviderProfilesSection() {
     setError("");
     try {
       await deleteProviderProfile(provider_id);
+      setRemoveId(null);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not remove provider");
@@ -709,15 +749,19 @@ function ProviderProfilesSection() {
     setError("");
     try {
       await setActiveProvider(provider_id);
+      setEditingId(provider_id);
       setStatus("Active provider updated.");
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not set active provider");
+      setError(
+        e instanceof Error ? e.message : "Could not set active provider",
+      );
     } finally {
       setBusy(false);
     }
   };
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [removeId, setRemoveId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<
     Record<string, ConnectionTestOutcome>
   >({});
@@ -733,6 +777,11 @@ function ProviderProfilesSection() {
       setTestingId(null);
     }
   };
+  const editingProfile = profiles.find(
+    (entry) => entry.profile.provider_id === editingId,
+  );
+  const activeProfile = profiles.find((entry) => entry.active);
+  const displayedProfile = editingProfile ?? activeProfile;
   return (
     <>
       <h3>Cloud providers</h3>
@@ -740,7 +789,12 @@ function ProviderProfilesSection() {
         Providers and auth fields come from the Rust catalog. Secrets stay on
         this device and are never shown again.
       </p>
-      <ProviderCatalogSettings onSave={(draft) => void save(draft)} />
+      <p className="field-help">New requests use the profile marked Active.</p>
+      <ProviderCatalogSettings
+        initialProfile={displayedProfile?.profile}
+        hasStoredSecret={displayedProfile?.key_configured ?? false}
+        onSave={save}
+      />
       {busy && <p className="field-help">Working…</p>}
       {status && (
         <p role="status" className="field-help">
@@ -752,19 +806,30 @@ function ProviderProfilesSection() {
           {error}
         </p>
       )}
+      {!profilesLoaded && <p role="status">Loading saved providers…</p>}
+      {profilesLoaded && profiles.length === 0 && (
+        <p className="empty-state">No saved providers yet.</p>
+      )}
       <ul className="provider-list">
         {profiles.map(({ profile, key_configured, active }) => (
           <li key={profile.provider_id}>
             <div>
-              <strong>
-                {profile.display_name ?? profile.provider_id}
-              </strong>{" "}
+              <strong>{profile.display_name ?? profile.provider_id}</strong>{" "}
               <small>{profile.auth_option_id}</small>
             </div>
-            <span className="badge amber">
-              {key_configured ? "Key stored" : "No key"}
+            <span className={`badge ${key_configured ? "green" : "amber"}`}>
+              {key_configured ? "Key stored" : "Key needed"}
             </span>
             {active && <span className="badge green">Active</span>}
+            <button
+              className="secondary"
+              type="button"
+              disabled={busy}
+              onClick={() => setEditingId(profile.provider_id)}
+              aria-label={`Edit ${profile.display_name ?? profile.provider_id}`}
+            >
+              Edit
+            </button>
             {!active && (
               <button
                 className="secondary"
@@ -783,7 +848,9 @@ function ProviderProfilesSection() {
               onClick={() => void test(profile.provider_id)}
               aria-label={`Test ${profile.display_name ?? profile.provider_id} connection`}
             >
-              {testingId === profile.provider_id ? "Testing…" : "Test connection"}
+              {testingId === profile.provider_id
+                ? "Testing…"
+                : "Test connection"}
             </button>
             {testResults[profile.provider_id] && (
               <p
@@ -801,14 +868,30 @@ function ProviderProfilesSection() {
               className="secondary"
               type="button"
               disabled={busy}
-              onClick={() => void remove(profile.provider_id)}
-              aria-label={`Remove ${profile.display_name ?? profile.provider_id}`}
+              onClick={() => {
+                if (removeId === profile.provider_id) {
+                  void remove(profile.provider_id);
+                } else {
+                  setRemoveId(profile.provider_id);
+                }
+              }}
+              aria-label={`${
+                removeId === profile.provider_id
+                  ? "Confirm removal of "
+                  : "Remove "
+              }${profile.display_name ?? profile.provider_id}`}
             >
-              <Trash2 size={17} /> Remove
+              <Trash2 size={17} />
+              {removeId === profile.provider_id ? "Confirm remove" : "Remove"}
             </button>
           </li>
         ))}
       </ul>
+      <FailoverSettings
+        profiles={profiles}
+        savedChain={failoverChain}
+        loadProfiles={refresh}
+      />
     </>
   );
 }
@@ -991,11 +1074,17 @@ function MemorySettings() {
   const [text, setText] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const load = async () => {
+    setLoading(true);
     try {
-      setMemories(await command<PersonalMemory[]>("list_memories"));
+      const loaded = await command<PersonalMemory[]>("list_memories");
+      setMemories(Array.isArray(loaded) ? loaded : []);
+      setError("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load memory");
+    } finally {
+      setLoading(false);
     }
   };
   useEffect(() => {
@@ -1068,7 +1157,11 @@ function MemorySettings() {
           </button>
         )}
       </form>
-      {memories.length === 0 ? (
+      {loading ? (
+        <p className="empty-state" role="status">
+          Loading memories…
+        </p>
+      ) : memories.length === 0 ? (
         <p className="empty-state">No saved memories.</p>
       ) : (
         memories.map((memory) => (
@@ -1122,8 +1215,8 @@ function DiagnosticsTab({ snapshot }: { snapshot: Snapshot }) {
             ? new Date(buildInfo.build_timestamp * 1000).toLocaleString()
             : "unknown"}
         </dd>
-        <dt>Needle</dt>
-        <dd>{snapshot.needle}</dd>
+        <dt>Bundled on-device model</dt>
+        <dd>{snapshot.needle === "ready" ? "Linked" : "Not linked"}</dd>
         <dt>Cloud credential</dt>
         <dd>{snapshot.cloud_credential}</dd>
         <dt>Voice</dt>
@@ -1133,6 +1226,80 @@ function DiagnosticsTab({ snapshot }: { snapshot: Snapshot }) {
         <dt>Tasks</dt>
         <dd>{snapshot.tasks.length}</dd>
       </dl>
+      <p className="field-help">
+        The bundled model answers tool decisions by itself. The on-device
+        observer below is a separate component: it runs alongside the cloud
+        model to measure what the local model would have done, and it never
+        answers.
+      </p>
+      <LocalShadowPanel state={snapshot.local_shadow} />
+    </section>
+  );
+}
+
+/**
+ * What the on-device model would have done, and how often it was right.
+ *
+ * The local model is only ever observed here. Nothing it proposes reaches an
+ * executor, so these numbers are the evidence for a future decision rather than
+ * a report of behaviour the user already got.
+ */
+function LocalShadowPanel({ state }: { state?: LocalShadowState }) {
+  if (!state?.provisioned) {
+    return (
+      <section className="local-shadow" aria-label="On-device observer">
+        <h3>On-device observer</h3>
+        <p className="field-help">
+          Not provisioned. Nothing is being measured, so every answer you get is
+          the cloud model's.
+        </p>
+      </section>
+    );
+  }
+  const pct = (value: number | null) =>
+    value === null ? "not enough data" : `${Math.round(value * 100)}%`;
+  return (
+    <section className="local-shadow" aria-label="On-device observer">
+      <h3>On-device observer</h3>
+      <span className="badge green">Active</span>
+      <p className="field-help">
+        Running beside each turn, recording what the local model would have
+        done. It cannot answer: every reply you have received came from the
+        cloud model, and nothing this observer proposes is ever run.
+      </p>
+      <dl>
+        <dt>Turns observed</dt>
+        <dd>{state.observations}</dd>
+        <dt>Agreed with the cloud</dt>
+        <dd>
+          {state.agreed} of {state.judgeable} comparable
+        </dd>
+        <dt>Overall agreement</dt>
+        <dd>{pct(state.agreement_rate)}</dd>
+        <dt>Agreement when confident</dt>
+        <dd>
+          {pct(state.gated_agreement_rate)}{" "}
+          <small>
+            at or above {state.threshold.toFixed(2)}, {state.gated_judgeable}{" "}
+            comparable
+          </small>
+        </dd>
+        <dt>Declined to act</dt>
+        <dd>{state.abstained}</dd>
+        <dt>No confidence score</dt>
+        <dd>{state.uncalibrated}</dd>
+      </dl>
+      <p className="field-help">
+        These numbers are a measurement, not a result. They only become evidence
+        once a real reasoning model, rather than a stub, is answering the same
+        turns.
+      </p>
+      {state.judgeable > 0 && state.gated_judgeable === 0 && (
+        <p className="field-help">
+          No observation has yet reached the confidence a local answer would
+          need, so nothing here could be trusted to act on its own.
+        </p>
+      )}
     </section>
   );
 }

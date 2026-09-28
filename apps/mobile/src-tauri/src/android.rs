@@ -331,11 +331,11 @@ pub fn run() {
                         if let Ok(Some(key)) =
                             auth.load(&provider_vault_handle(&profile.provider_id)?, &binding)
                         {
-                            runtime.restore_provider_key(
+                            tauri::async_runtime::block_on(runtime.restore_provider_key(
                                 &profile.provider_id,
                                 &profile.auth_option_id,
                                 key,
-                            )?;
+                            ))?;
                         }
                     }
                     let store = Arc::new(storage_sqlite::SqliteStore::open(

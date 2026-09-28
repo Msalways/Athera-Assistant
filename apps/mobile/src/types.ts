@@ -47,6 +47,9 @@ export interface Task {
   plan: string[];
   step: number;
   message: string;
+  /** The provider that answered this turn. Set only when a fallback chain is
+   * configured, so an ordinary single-provider reply stays unlabelled. */
+  answered_by?: string | null;
   output?: AssistantOutput | null;
   result_refs: string[];
   pending: {
@@ -154,6 +157,43 @@ export interface BuildInfo {
   build_timestamp: number;
   version: string;
 }
+export interface FailoverMember {
+  provider_id: string;
+  display_name: string;
+}
+
+export interface LocalShadowState {
+  /** Whether an on-device model has been provisioned for observation. */
+  provisioned: boolean;
+  observations: number;
+  /** Turns where the cloud used a tool, so agreement is judgeable. */
+  judgeable: number;
+  agreed: number;
+  /** Times the local model proposed nothing, which is a correct refusal. */
+  abstained: number;
+  /** Observations with no confidence score, which cannot be gated on. */
+  uncalibrated: number;
+  agreement_rate: number | null;
+  gated_agreement_rate: number | null;
+  gated_judgeable: number;
+  gated_agreed: number;
+  threshold: number;
+}
+
+export interface FailoverState {
+  /** True only when an ordered chain of more than one provider is active. */
+  configured: boolean;
+  chain: FailoverMember[];
+  /** The provider that most recently answered, if any. */
+  served_by: string | null;
+}
+
+export interface FailoverPolicy {
+  schema: "aethra.failover-policy.v1";
+  primary_provider_id: string;
+  fallback_provider_ids: string[];
+}
+
 export interface Snapshot {
   cloud_session_key: boolean;
   cloud_credential: "not_configured" | "missing" | "configured";
@@ -167,6 +207,8 @@ export interface Snapshot {
   adaptive_rules?: AdaptiveRule[];
   rule_proposals?: RuleProposal[];
   suggestions?: NextStepSuggestion[];
+  failover?: FailoverState;
+  local_shadow?: LocalShadowState;
 }
 
 export interface CloudConnectionTest {
@@ -355,12 +397,7 @@ export type AuthKind =
   | "cloud_identity"
   | "custom_compatible";
 export type ConfigFieldKind =
-  | "text"
-  | "secret"
-  | "select"
-  | "boolean"
-  | "url"
-  | "integer";
+  "text" | "secret" | "select" | "boolean" | "url" | "integer";
 export interface VisibilityRule {
   field_id: string;
   equals: string;

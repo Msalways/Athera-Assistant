@@ -2,7 +2,7 @@ use assistant_contracts::*;
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -163,6 +163,41 @@ impl Assistant {
         }
         Ok(ready)
     }
+
+    pub fn recover_unfinished_tasks(&self) -> Result<Vec<Id>> {
+        let mut ready = Vec::new();
+        for mut task in self.store.unfinished_tasks()? {
+            if task.work_graph.is_some()
+                || !matches!(task.status, TaskStatus::Created | TaskStatus::Running)
+            {
+                continue;
+            }
+            if task.status == TaskStatus::Created && task.pending.is_none() {
+                ready.push(task.id);
+                continue;
+            }
+            match task.pending.as_ref() {
+                Some(pending) if pending.started => {
+                    task.status = TaskStatus::WaitingForResolution;
+                    task.message =
+                        "An interrupted action needs its outcome checked before continuing.".into();
+                    self.store.save_task(&task)?;
+                }
+                Some(pending) if !pending.approved => {
+                    task.status = TaskStatus::WaitingForApproval;
+                    task.message = "Review the pending action before it runs.".into();
+                    self.store.save_task(&task)?;
+                }
+                _ => {
+                    task.status = TaskStatus::Created;
+                    task.message = "Task resumed after an interrupted run.".into();
+                    self.store.save_task(&task)?;
+                    ready.push(task.id);
+                }
+            }
+        }
+        Ok(ready)
+    }
     pub async fn run(&self, id: Id) -> Result<Task> {
         let _guard = self.runner.lock().await;
         let mut task = self.store.task(id)?;
@@ -278,6 +313,8 @@ impl Assistant {
             let sink_active = worker_active.clone();
             let streamed_bytes = Arc::new(AtomicUsize::new(0));
             let sink_bytes = streamed_bytes.clone();
+            let answered_by: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+            let answered_by_slot = answered_by.clone();
             let sink: ProviderEventSink = Arc::new(move |event| {
                 if !sink_active.load(Ordering::Acquire)
                     || event_store.task(run_id)?.status == TaskStatus::Cancelled
@@ -285,6 +322,12 @@ impl Assistant {
                     return Ok(());
                 }
                 match event {
+                    ProviderEvent::ProviderSelected { provider_id } => {
+                        // Record which vendor is answering this turn. A fallback
+                        // that stays invisible would misattribute the answer.
+                        *answered_by_slot.lock().map_err(|_| Error::Conflict)? = Some(provider_id);
+                        Ok(())
+                    }
                     ProviderEvent::TextDelta { text } => {
                         if sink_bytes
                             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -337,6 +380,12 @@ impl Assistant {
             })?;
             match outcome {
                 Ok(action) => {
+                    // Attribute the turn to the provider that actually answered.
+                    if let Ok(slot) = answered_by.lock() {
+                        if let Some(provider_id) = slot.as_ref() {
+                            task.answered_by = Some(provider_id.clone());
+                        }
+                    }
                     if let Err(error) = self.apply(&mut task, action, &exposed) {
                         self.failure(&mut task, error)?;
                     } else {
@@ -365,15 +414,52 @@ impl Assistant {
             }
         }
     }
+    /// A tool that could not run is not a cloud-model problem. Reporting it as
+    /// one sends the user to the provider screen when the real fix is the
+    /// connection this tool needs, so name the tool and the cause.
+    fn tool_failure(&self, task: &mut Task, tool: &ToolSpec, error: Error) -> Result<()> {
+        task.failures += 1;
+        task.status = TaskStatus::Failed;
+        task.message = match error {
+            Error::Unavailable | Error::AuthRequired => {
+                format!(
+                    "{} could not run because its connection is not available. Connect or enable {} in Settings, then try again.",
+                    tool.name, tool.connection_id
+                )
+            }
+            Error::Denied => format!(
+                "{} was blocked before it ran. Check the tool's permissions in Settings.",
+                tool.name
+            ),
+            Error::InvalidInput => format!(
+                "{} was called with arguments it cannot accept, so it did not run.",
+                tool.name
+            ),
+            other => format!("{} failed: {}", tool.name, other),
+        };
+        self.store.save_task(task)
+    }
+
     fn failure(&self, task: &mut Task, error: Error) -> Result<()> {
         task.failures += 1;
         task.message = error.to_string();
         if error == Error::Unavailable && task.role != Role::Fast {
             task.status = TaskStatus::Failed;
-            task.message =
-                "The cloud model is unavailable. Check the provider settings and connection."
-                    .into();
-            return self.store.save_task(task);
+            // An unreachable provider is not a settings problem, and telling the
+            // user to check their settings sends them somewhere that cannot fix a
+            // dropped connection. A credential or model fault arrives as a
+            // different error and keeps its own accurate message.
+            task.message = "No reasoning model is reachable right now, so this could not be answered. Reconnect or configure a provider and try again.".into();
+            self.store.save_task(task)?;
+            return self
+                .store
+                .save_task_blocker(
+                    task.id,
+                    &TaskBlocker::ReasoningUnavailable {
+                        detail: error.to_string(),
+                    },
+                )
+                .map(|_| ());
         }
         if task.role == Role::Fast {
             task.role = Role::Reasoner;
@@ -409,6 +495,9 @@ impl Assistant {
                     return Err(Error::Denied);
                 }
                 let needs_approval = current.risk.requires_approval();
+                // Record the choice on the task before the pending action can be
+                // cleared, so what a turn decided is still knowable afterwards.
+                task.invoked_tool = Some(selected.id.clone());
                 task.pending = Some(PendingAction {
                     id: Id::new_v4(),
                     call,
@@ -633,7 +722,7 @@ impl Assistant {
                     ) =>
             {
                 task.pending = None;
-                self.failure(task, error)?;
+                self.tool_failure(task, &current, error)?;
             }
             Err(_) => {
                 task.status = TaskStatus::WaitingForResolution;

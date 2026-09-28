@@ -272,7 +272,7 @@ pub fn nvidia_definition() -> ProviderDefinition {
         },
         endpoint_fields: vec![
             base_url_field(false, "Defaults to https://integrate.api.nvidia.com/v1"),
-            model_field("NIM model ID, e.g. meta/llama-3.1-8b-instruct"),
+            model_field("NIM model ID, e.g. nvidia/llama-3.1-nemotron-70b-instruct. Check https://integrate.api.nvidia.com/v1/models for what your key can use."),
         ],
         model_source: ModelSource::UserSpecified,
         auth_options: vec![api_key_option()],

@@ -368,10 +368,10 @@ function EmptyConversation({
         ? "Verifying the downloaded local model."
         : installation?.status === "failed"
           ? `The model download failed${installation.error ? `: ${installation.error}` : ". Retry from Settings."}`
-            : installation?.status === "cancelled"
+          : installation?.status === "cancelled"
             ? "The model download was cancelled. Set it up when you are ready."
             : availability === "missing_model"
-              ? "Needle is ready for lightweight on-device routing. Configure a cloud model in Settings for conversational answers; the offline model is optional."
+              ? "An on-device model is available for lightweight routing. Configure a cloud model in Settings for conversational answers; the offline model is optional."
               : availability === "unavailable"
                 ? "Local conversation is unavailable on this device."
                 : availability === "busy"
