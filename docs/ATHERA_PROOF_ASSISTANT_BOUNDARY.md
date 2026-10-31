@@ -604,3 +604,234 @@ physical device, and nothing in the `hi` proof touched it.
 above, and the committed Android WebView assets carry older bundle hashes than
 `dist`. A device test must start with a fresh `scripts/build-android-apk.ps1`
 run, or it will exercise code that no longer exists.
+
+## Device-verified: MCP, and a provider fault that was misreported (2026-09-29)
+
+Evidence class: **device-verified** on LDPlayer, Android 14 (SDK 34), 1080x1920.
+A fresh APK containing the current tree was installed over the previous one.
+
+**The Android build was broken and nobody could have known.** The mobile
+`.setup(|app, api|)` callback already receives an `&AppHandle`, so the reconnect
+worker in `android.rs` calling `app.handle()` did not compile. Every earlier APK
+had been assembled from committed assets predating the current source. Fixed to
+`app.clone()`.
+
+**MCP works on a device.** `https://search.parallel.ai/mcp` reports "Connected -
+MCP session is active" after a forced reconnect, and Composio correctly reports
+"Authorization required". Your configured-versus-live distinction is doing real
+work.
+
+**A refused MCP connection failed silently.** `addConnection` had a `catch` only
+on the OAuth path, so the two common paths rejected into nothing. The runtime also
+returns a bare `Invalid input` for any address it will not accept. Both fixed:
+Add, Reconnect and Disconnect now report, and a preflight names the reason
+(`mcpUrlProblem`) - https-only, or a loopback address that names the device
+rather than the computer. Verified by screenshot.
+
+**A silent provider was reported as a network timeout.** Traced with a forwarding
+proxy rather than guessed at:
+
+    #2 upstream FAILED after 45011ms: This operation was aborted
+
+The request left the device with a valid key attached and NVIDIA held the
+connection open, returning nothing. A deliberately bad key, to the same
+endpoint, returned 401 in 0.13s - so reachability and key validity were both
+already proven, and the only remaining explanation is an account with no
+inference entitlement. It was reported as "Operation timed out" and retried three
+times, which is ~90s of spinner and a message that sent the user to check their
+network.
+
+Fixed as three changes:
+- `NormalizedError::NoResponse`, distinct from `Timeout`. Reached only when a
+  delivered request goes unanswered, so it cannot absorb a real network fault.
+- No failover on it. A second key would be ignored the same way, and switching
+  would hide a setup mistake behind a working-looking answer.
+- Not retried, and the message names the provider and the exact model, because
+  access is granted per model.
+
+Proved the app was never slow: pointed at a server answering 403 in 1-6ms, it
+reported "Action denied" three times in under 200ms.
+
+**A developer action log now exists** (`migrations/012_diagnostics.sql`,
+`Store::record_diagnostic`, surfaced in Settings > Developer Diagnostics).
+It records what the runtime attempted and the exact error each attempt returned,
+including the parts that never reach the user: abandoned retries, and the
+provider's own wording. An entry that stops at `started` is how a request that
+went out and never came back is identified after the fact - which is precisely
+the evidence that was missing when this was first reported as an unexplained
+timeout. Bounded per entry and pruned by count, so it cannot grow without limit
+on a device that is rarely reinstalled. `detail` carries no credential: the key is
+never read, only the presence of an Authorization header was ever checked.
+
+## 2026-09-30 - The provider's own words reached nobody
+
+### What was reported
+Turns failed with "No reasoning model is reachable right now" or "The cloud
+provider's rate limit or quota was reached. Try a new task after its retry
+window." Neither sentence named a cause, a provider, or an action.
+
+### What was actually happening
+Two different faults, both real, neither visible:
+
+1. The OpenRouter profile had `openrouter/free` set as its model. OpenRouter
+   answered **429** in 519ms with:
+   `Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free
+   model requests per day`, plus `remedy_hint: Wait for the daily reset (see
+   X-RateLimit-Reset), or purchase credits`.
+   Athera mapped 429 to `RateLimited { retry_after_secs }`, dropped the body, and
+   told the user to retry later. Against a quota that resets tomorrow, that
+   advice cannot work.
+
+2. Any other 4xx - a 400, a 422 - fell through `map_status` to
+   `ProviderError`, which `engine_error` mapped to `Error::Unavailable`, which
+   the engine rendered as "no reasoning model is reachable". A provider that
+   answered clearly and said no was reported as a host that could not be reached.
+
+Device-verified method: the app's Base URL was pointed at a host forwarding proxy
+(`adb reverse`), which passed `Authorization` through without printing it and
+logged the request shape and the vendor's exact reply. The proxy proved the
+request Athera builds is well-formed and the key is valid; the loss happened
+afterwards, in Athera's own error mapping.
+
+### Fixed
+- `NormalizedError::RateLimited` carries the provider's `detail`.
+- `Error::ProviderFault { status, summary }` carries it to the task message.
+  `map_status` no longer collapses a 402/400/422 into "unreachable".
+- `provider_text()` reads the provider's own wording from the shapes providers
+  actually send (`error.message` + `metadata.remedy_hint`, `message`, `detail`,
+  `error` as a string, or a non-JSON body), bounded, marked when truncated.
+- The chat message now reads e.g.
+  `openrouter returned HTTP 429: Rate limit exceeded: free-models-per-day. Add
+  10 credits to unlock 1000 free model requests per day`
+- Retrying narrowed to faults a second identical attempt could clear. A limit, an
+  exhausted balance, or a refused request is asked **once** (`graph.rs`);
+  previously a limit was retried 3x, burning the quota that was already gone.
+- 402 fails over again. Routing 402 into `ProviderError` had silently made an
+  exhausted balance non-fail-over-able, which is the case fallback exists for.
+
+### Boundary kept
+The connection-test message still does not echo provider bodies, and
+`connection_test_messages_do_not_echo_provider_bodies` still passes. A provider
+can reflect a credential or the prompt back inside its error, and that message
+lands on a Settings surface a user may screenshot. The provider's exact words go
+to the developer action log instead, which is where untrusted text belongs.
+
+### Not claimed
+The task message renders provider-controlled text on the user's own device. The
+provider already holds the credential (it received it in the Authorization
+header) and the message is never transmitted, so this discloses nothing new - but
+it is provider-controlled text in a chat card, and a screenshot of that card is
+the user's to manage.
+### A regression this change introduced, and what it taught
+Carrying the provider's words through also captured a case where the provider
+never spoke. With the Base URL restored to the real endpoint, a turn failed with
+`openrouter reported: Http client error: error sending request for url
+(https://openrouter.ai/api/v1/chat/completions)`.
+
+That is a request that never reached OpenRouter, described as though OpenRouter
+had answered, in a client library's phrasing, blaming the provider for something
+that never left the device. The cause was `CompletionError::ProviderError`, which
+carries no HTTP response, being treated as a provider reply.
+
+Fixed by keeping the two apart on the one fact that distinguishes them - a
+response arrived or it did not:
+- no response at all -> the transport classifier, and `error sending request` /
+  `error connect` are now recognised as network faults, so this is reported as an
+  unreachable provider rather than as something the provider said.
+- a response whose status could not be read -> still the provider replying, so
+  its words are kept.
+
+The general rule this exposed, and the one worth keeping: "the provider's own
+words" is only ever true when a response actually arrived. Every other path must
+be named for what it is.
+## Still open, found while verifying the above
+
+**The app cannot complete a direct HTTPS request to OpenRouter; the device can.**
+With the Base URL restored to `https://openrouter.ai/api/v1` and the model
+`openai/gpt-oss-120b`, every turn fails at the transport layer. Device-side
+`curl` to the same URL succeeds for GET, non-streaming POST, streaming POST, and
+a ~4KB body with tools - 200/401 in 0.15-0.6s each. The same turn succeeds when
+the request is routed through a host proxy over plain HTTP, so the request Athera
+builds is well formed and the key is accepted.
+
+Not yet narrowed. The two clients are built differently: `provider-rig` goes
+through Rig's own builder (`rig-core/rustls`), while the workspace `reqwest` is
+pinned to `rustls-tls` + `rustls-platform-verifier 0.7`, and Android's trust
+store is not where a platform verifier normally looks. HTTPS from this app does
+work elsewhere - MCP reached `https://search.parallel.ai/mcp` - so this is not a
+blanket TLS failure. The next step is to put Rig's transport error text in front
+of a person instead of in a log nobody reads.
+
+**A transport fault is still logged lossily.** The action log recorded
+`error=Capability unavailable` for the failure above, which is `Error::Unavailable`
+with no detail. The real reason - "error sending request for url" - reached the
+chat card before the transport fix and reaches nothing now. This is the same bug
+class as the one fixed above, one layer down: `NormalizedError::NetworkUnavailable`
+and `EndpointNotFound` still carry no `detail`, so a log that exists to record
+the exact error records a category instead. Not fixed.
+### Reading the log proved the log was still one layer short
+The first fix made the action log record `unreachable` plus
+"Http client error: error sending request for url (...)" - better than the
+category, but still not a cause. That phrase is the outermost wrapper every HTTP
+client emits when it fails to put a request on the wire; the actual reason sits
+one `source()` link deeper. A certificate that will not validate, a refused
+connection, and an unresolvable host all produce that identical sentence.
+
+`transport_chain()` now walks `source()` to the root (bounded at 8 links,
+cycle-safe) and records the whole chain, so the cause and the symptom are both
+visible. A failure that is neither the network nor the provider can now be
+identified instead of guessed at.
+
+### What the log showed that was not expected
+Alongside the openrouter failures, every turn also logs:
+`provider_request - needle2 - ok / provider returned an action`, at
+`role=Fast step=1`. The bundled on-device model is answering the fast tier of
+every single turn and is not blocked by the cloud at all. The cloud failure ends
+the turn at `role=Reasoner`; it is not preventing the local model from working.
+## Web support: what "web" means, and what already exists
+
+Asked for and then clarified: **the app running in a browser, connecting to cloud
+LLM providers over the internet. Not a desktop build.** For now the native app
+is the delivery target; the web transport is the foundation underneath it.
+
+Most of it is already built, which was not obvious:
+- `crates/assistant-cli/src/dev.rs` is an axum bridge (`assistant-dev.exe`, port
+  8787) exposing `/api/health`, `/api/command`, `/api/evaluate-fixture`. It binds
+  **loopback only**.
+- `service.ts` already dual-paths: `isTauri()` -> `invoke()`, otherwise
+  `fetch("/api/command")`. **The React UI is transport-agnostic**, so a browser
+  build needs no new frontend code.
+- The UI already polls `events` every 750ms through the same command transport,
+  so streaming progress works over HTTP with no SSE work.
+
+Verified live: `vite build` -> serve `apps/mobile/dist` on 1420 -> reverse-proxy
+`/api` to 8787. `/api/health` ready; `get_provider_catalog`,
+`list_provider_profiles`, `list_conversations`, `diagnostics`, `snapshot` all
+200; and the loopback/rebinding guard still answers 403 to a foreign `Host`.
+
+What is genuinely missing is **identity**, not features. `local_client()` exists
+precisely to stop DNS rebinding and cross-site writes against a runtime that
+holds cloud API keys. Exposing the bridge beyond loopback therefore needs real
+authentication and sessions; it is not a bind-address flag. A deployed TLS
+origin is also required.
+
+## Cloudflare-fronted hosts are the actual blocker, not OpenRouter
+
+While restoring the Base URL, tested `api.cloudflare.com` (same CDN as
+OpenRouter) through the app's own "Test connection". **It fails identically**,
+while NVIDIA (AWS) succeeds. So the fault is a property of Cloudflare-fronted
+hosts versus this HTTP client, not of OpenRouter. That is the useful finding.
+
+Established with controls, not inference:
+- App -> NVIDIA: request DELIVERED, provider silent. HTTPS works in-app.
+- App -> OpenRouter and -> api.cloudflare.com: fails before any response.
+- Device `curl` -> BOTH hosts, over IPv4, IPv6, HTTP/1.1 and plain HTTP, with
+  GET, POST, streaming and a 4KB body carrying tools: 0.15-0.6s each.
+- `rustls-platform-verifier` is declared in `Cargo.toml` and used in **zero**
+  lines of code. Two earlier claims that it was the cause were wrong.
+- `reqwest`'s `Display` stops at "error sending request for url" and `source()`
+  is empty at Rig's boundary, so the action log genuinely cannot name the cause.
+
+Notable untested lead: `curl` negotiated **only http/1.1** with Cloudflare, while
+`reqwest` offers h2. ALPN is the next thing to vary, and it is a one-line change
+to the client.

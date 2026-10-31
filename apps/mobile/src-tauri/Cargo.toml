@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde_json = "1"
 app-runtime = { path = "../../../crates/app-runtime" }
+adapter-mcp = { path = "../../../crates/adapter-mcp" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 assistant-contracts = { path = "../../../crates/contracts" }
@@ -23,6 +24,8 @@ storage-sqlite = { path = "../../../crates/storage-sqlite" }
 provider-needle = { path = "../../../crates/provider-needle", features = ["native-static"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["time"] }
+jni = "0.22.4"
+rustls-platform-verifier = "0.7.0"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

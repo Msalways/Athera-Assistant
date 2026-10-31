@@ -146,24 +146,83 @@ pub enum NormalizedError {
     AuthorizationDenied,
     EndpointNotFound,
     ModelNotFound,
-    RateLimited { retry_after_secs: Option<u64> },
+    RateLimited {
+        retry_after_secs: Option<u64>,
+        /// The provider's own account of the limit, in its words.
+        ///
+        /// A status code cannot say whether a limit resets in a minute or in a
+        /// day, nor whether credits, a plan, or a request ceiling is what ran
+        /// out. Those are the facts that decide what the user does next, and
+        /// only the provider knows them.
+        detail: String,
+    },
     QuotaExceeded,
     Timeout,
-    NetworkUnavailable,
-    InvalidResponse { detail: String },
-    ProviderError { status: u16, detail: String },
+    /// The request was sent and the provider never replied.
+    ///
+    /// Separate from `Timeout` on purpose. A provider that accepts a request and
+    /// then holds the connection open behaves, to a client, like a very slow
+    /// network — but the fix is a key with entitlement, not better signal. Naming
+    /// it separately is what lets the UI say so.
+    NoResponse,
+    /// The request could not be put on the wire, or no reply came back.
+    ///
+    /// Carries the underlying reason because "unreachable" is a category, not a
+    /// diagnosis. A refused connection, an unresolvable host, and a failed
+    /// certificate check are three different problems with three different fixes,
+    /// and only the client library knows which one happened.
+    NetworkUnavailable {
+        detail: String,
+    },
+    InvalidResponse {
+        detail: String,
+    },
+    ProviderError {
+        status: u16,
+        detail: String,
+    },
 }
 
 impl NormalizedError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Timeout | Self::NetworkUnavailable
+            Self::RateLimited { .. } | Self::Timeout | Self::NetworkUnavailable { .. }
         )
     }
 
     pub fn is_credential_error(&self) -> bool {
         matches!(self, Self::AuthenticationFailed | Self::AuthorizationDenied)
+    }
+
+    /// Words the provider itself sent, when it sent any.
+    ///
+    /// Reserved for a response that actually arrived. A transport failure has a
+    /// reason too, but it belongs to the client rather than the provider, and
+    /// mixing the two is what lets a connection failure be read as something a
+    /// provider said. Transport reasons are carried on their own variants and
+    /// reach the diagnostics log through `reason_text`.
+    pub fn provider_text(&self) -> Option<&str> {
+        match self {
+            Self::RateLimited { detail, .. }
+            | Self::InvalidResponse { detail }
+            | Self::ProviderError { detail, .. } => Some(detail.as_str()),
+            _ => None,
+        }
+        .filter(|text| !text.trim().is_empty())
+    }
+
+    /// The underlying reason for a fault, whoever it belongs to.
+    ///
+    /// This is what the developer action log records, so that a fault which is
+    /// neither the network nor the provider can still be identified.
+    pub fn reason_text(&self) -> Option<&str> {
+        self.provider_text()
+            .or(match self {
+                Self::NetworkUnavailable { detail } => Some(detail.as_str()),
+                _ => None,
+            })
+            .filter(|text| !text.trim().is_empty())
     }
 }
 
@@ -195,7 +254,8 @@ mod tests {
     #[test]
     fn normalized_error_retryable() {
         assert!(NormalizedError::RateLimited {
-            retry_after_secs: Some(60)
+            retry_after_secs: Some(60),
+            detail: String::new(),
         }
         .is_retryable());
         assert!(NormalizedError::Timeout.is_retryable());

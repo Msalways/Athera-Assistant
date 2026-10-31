@@ -7,6 +7,8 @@ pub struct ScriptedProvider {
     pub actions: Mutex<VecDeque<Result<AgentAction>>>,
     pub events: Mutex<VecDeque<Vec<ProviderEvent>>>,
     pub local: bool,
+    /// Model id this provider reports, so a fault can name the model that failed.
+    pub model: Option<String>,
 }
 impl ScriptedProvider {
     pub fn new(local: bool, actions: Vec<AgentAction>) -> Self {
@@ -14,6 +16,7 @@ impl ScriptedProvider {
             local,
             actions: Mutex::new(actions.into_iter().map(Ok).collect()),
             events: Mutex::new(VecDeque::new()),
+            model: None,
         }
     }
 
@@ -26,6 +29,17 @@ impl ScriptedProvider {
             local,
             actions: Mutex::new(actions.into_iter().map(Ok).collect()),
             events: Mutex::new(events.into()),
+            model: None,
+        }
+    }
+
+    /// A provider that fails every call with `error`, for exercising fault paths.
+    pub fn failing(local: bool, error: Error) -> Self {
+        Self {
+            local,
+            actions: Mutex::new((0..8).map(|_| Err(error.clone())).collect()),
+            events: Mutex::new(VecDeque::new()),
+            model: Some("scripted/model-v1".into()),
         }
     }
 
@@ -48,6 +62,9 @@ impl ModelProvider for ScriptedProvider {
             planning: true,
             local: self.local,
         }
+    }
+    fn model(&self) -> &str {
+        self.model.as_deref().unwrap_or("")
     }
     async fn infer(&self, _: ContextBundle) -> Result<AgentAction> {
         self.next_action()

@@ -131,13 +131,31 @@ impl RigCloudProvider {
                 NormalizedError::AuthorizationDenied => Error::Denied,
                 NormalizedError::EndpointNotFound => Error::Unavailable,
                 NormalizedError::ModelNotFound => Error::InvalidResponse,
-                NormalizedError::RateLimited { .. } | NormalizedError::QuotaExceeded => {
-                    Error::RateLimited
-                }
+                NormalizedError::QuotaExceeded => Error::RateLimited,
                 NormalizedError::Timeout => Error::Timeout,
-                NormalizedError::NetworkUnavailable => Error::Unavailable,
+                NormalizedError::NoResponse => Error::ProviderSilent,
+                NormalizedError::NetworkUnavailable { detail } => Error::Unreachable { detail },
                 NormalizedError::InvalidResponse { .. } => Error::InvalidResponse,
-                NormalizedError::ProviderError { .. } => Error::Unavailable,
+                // Reached instead of a lossy category so the provider's own words
+                // reach the person who has to act on them. `Unavailable` is kept
+                // for a host that could not be reached, which is a different fault
+                // with a different fix and must not absorb a provider that
+                // answered clearly and said no.
+                NormalizedError::RateLimited { .. } | NormalizedError::ProviderError { .. } => {
+                    let detail = normalized
+                        .provider_text()
+                        .unwrap_or("The provider rejected the request without saying why.")
+                        .to_owned();
+                    let status = match &normalized {
+                        NormalizedError::RateLimited { .. } => 429,
+                        NormalizedError::ProviderError { status, .. } => *status,
+                        _ => 0,
+                    };
+                    Error::ProviderFault {
+                        status,
+                        summary: detail,
+                    }
+                }
             },
             RigAdapterError::Factory(_) | RigAdapterError::RequestFailed(_) => Error::InvalidInput,
         }
@@ -156,6 +174,10 @@ impl ModelProvider for RigCloudProvider {
             planning: true,
             local: false,
         }
+    }
+
+    fn model(&self) -> &str {
+        self.model_name()
     }
 
     async fn infer(&self, context: ContextBundle) -> Result<AgentAction> {
@@ -346,16 +368,26 @@ mod tests {
         assert_eq!(
             RigCloudProvider::engine_error(RigAdapterError::Normalized(
                 NormalizedError::RateLimited {
-                    retry_after_secs: None
+                    retry_after_secs: None,
+                    detail: "free-models-per-day: add 10 credits to raise the limit".into(),
                 }
             )),
-            Error::RateLimited
+            Error::ProviderFault {
+                status: 429,
+                summary: "free-models-per-day: add 10 credits to raise the limit".into(),
+            }
         );
+        // An unreachable provider keeps the reason it was unreachable. Losing it
+        // is what leaves a certificate failure looking like a dead network.
         assert_eq!(
             RigCloudProvider::engine_error(RigAdapterError::Normalized(
-                NormalizedError::NetworkUnavailable
+                NormalizedError::NetworkUnavailable {
+                    detail: "certificate verify failed".into(),
+                }
             )),
-            Error::Unavailable
+            Error::Unreachable {
+                detail: "certificate verify failed".into(),
+            }
         );
     }
 }

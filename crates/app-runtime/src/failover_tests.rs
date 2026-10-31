@@ -357,9 +357,12 @@ async fn a_deleted_profile_reports_a_fault_that_cannot_be_treated_as_transient()
 fn transient_failures_are_the_only_ones_allowed_to_move_vendor() {
     // The rule the whole feature rests on.
     assert!(may_fail_over(&NormalizedError::Timeout));
-    assert!(may_fail_over(&NormalizedError::NetworkUnavailable));
+    assert!(may_fail_over(&NormalizedError::NetworkUnavailable {
+        detail: String::new(),
+    }));
     assert!(may_fail_over(&NormalizedError::RateLimited {
-        retry_after_secs: None
+        retry_after_secs: None,
+        detail: String::new(),
     }));
     // Setup and capability facts must surface to the user instead.
     assert!(!may_fail_over(&NormalizedError::AuthenticationFailed));

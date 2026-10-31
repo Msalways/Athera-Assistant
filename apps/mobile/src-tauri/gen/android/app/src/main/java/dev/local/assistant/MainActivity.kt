@@ -6,6 +6,8 @@ import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
 
 class MainActivity : TauriActivity() {
+  private external fun initRustlsVerifier(context: android.content.Context)
+
   override fun onWebViewCreate(webView: WebView) {
     val appVersion = packageManager.getPackageInfo(packageName, 0).longVersionCode
     val preferences = getSharedPreferences("athera.webview", MODE_PRIVATE)
@@ -19,6 +21,8 @@ class MainActivity : TauriActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
+    System.loadLibrary("assistant_mobile_shell")
+    initRustlsVerifier(this)
     super.onCreate(savedInstanceState)
     AuthPlugin.captureCallback(intent?.dataString)
   }

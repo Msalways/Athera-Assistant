@@ -108,15 +108,26 @@ pub fn compatible_fallback(
 /// would hide them and send the request somewhere the user did not choose.
 pub fn may_fail_over(error: &NormalizedError) -> bool {
     match error {
-        NormalizedError::NetworkUnavailable
+        NormalizedError::NetworkUnavailable { .. }
         | NormalizedError::Timeout
         | NormalizedError::RateLimited { .. }
         | NormalizedError::QuotaExceeded => true,
-        NormalizedError::ProviderError { status, .. } => *status >= 500 || *status == 0,
+        // 402 and 429 are about this provider's account, not about the request,
+        // so a second vendor with its own billing is a genuine way forward and is
+        // the case fallback exists for. A 4xx that faults the request itself is
+        // not: the same request would be refused identically elsewhere, and
+        // switching would hide a bad model or a bad setting behind an answer that
+        // looks fine.
+        NormalizedError::ProviderError { status, .. } => *status >= 500 || *status == 0 || *status == 402,
         NormalizedError::AuthenticationFailed
         | NormalizedError::AuthorizationDenied
         | NormalizedError::ModelNotFound
         | NormalizedError::EndpointNotFound
+        // A silent provider is not a reason to try someone else. The request was
+        // delivered, so the fault is that provider's access to that model, and a
+        // different key would be refused or ignored in the same way. Switching
+        // would hide a setup mistake behind a working-looking answer.
+        | NormalizedError::NoResponse
         | NormalizedError::InvalidResponse { .. } => false,
     }
 }
@@ -237,16 +248,40 @@ mod tests {
 
     #[test]
     fn transient_conditions_may_fail_over() {
-        assert!(may_fail_over(&NormalizedError::NetworkUnavailable));
+        assert!(may_fail_over(&NormalizedError::NetworkUnavailable {
+            detail: String::new(),
+        }));
         assert!(may_fail_over(&NormalizedError::Timeout));
         assert!(may_fail_over(&NormalizedError::RateLimited {
-            retry_after_secs: Some(30)
+            retry_after_secs: Some(30),
+            detail: String::new(),
         }));
         assert!(may_fail_over(&NormalizedError::QuotaExceeded));
         assert!(may_fail_over(&NormalizedError::ProviderError {
             status: 503,
             detail: String::new()
         }));
+        // An exhausted balance is this vendor's billing, not a fault in the
+        // request, so a second vendor with its own credits is a real way forward.
+        assert!(may_fail_over(&NormalizedError::ProviderError {
+            status: 402,
+            detail: "insufficient credits".into(),
+        }));
+    }
+
+    /// The distinction that keeps fallback honest: a fault about the account can
+    /// be routed around, a fault about the request cannot.
+    #[test]
+    fn a_rejected_request_never_fails_over_even_though_the_status_is_an_error() {
+        for status in [400u16, 405, 409, 413, 415, 422] {
+            assert!(
+                !may_fail_over(&NormalizedError::ProviderError {
+                    status,
+                    detail: "unsupported parameter".into(),
+                }),
+                "HTTP {status} describes the request, so retrying elsewhere would only hide it"
+            );
+        }
     }
 
     #[test]

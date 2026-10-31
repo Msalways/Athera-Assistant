@@ -75,8 +75,36 @@ pub enum Error {
     Timeout,
     #[error("Provider response is invalid")]
     InvalidResponse,
+    /// The request reached the provider but no reply ever arrived.
+    ///
+    /// Deliberately not the same as `Timeout`. A dropped connection and a provider
+    /// that accepts a request and then says nothing are different faults with
+    /// different fixes, and reporting both as a timeout sends the user to check
+    /// their network when the network was never the problem. The one thing that
+    /// produces this is a request that was sent and never answered.
+    #[error("The provider accepted the request but never replied")]
+    ProviderSilent,
     #[error("Rate limited")]
     RateLimited,
+    /// A fault the provider described in its own words.
+    ///
+    /// A status code is enough to route a fault but not enough to fix one.
+    /// "HTTP 429" does not say whether the limit clears in a minute or tomorrow,
+    /// nor whether credits, a plan, or a request ceiling is what ran out — and
+    /// only the provider knows. Substituting our own generic sentence for the
+    /// provider's explanation is what turns a solvable fault into a dead end, so
+    /// the explanation is carried to the person who has to act on it.
+    #[error("{summary}")]
+    ProviderFault { status: u16, summary: String },
+    /// The provider could not be reached, and the transport said why.
+    ///
+    /// Kept separate from `ProviderFault` because the distinction decides who to
+    /// blame: one provider said no, the other was never contacted. Carries the
+    /// underlying reason so that a fault which is neither the network nor the
+    /// provider, such as a certificate that will not validate or a proxy that
+    /// intercepts, stops looking like a connectivity problem.
+    #[error("unreachable")]
+    Unreachable { detail: String },
     #[error("Storage failure")]
     Storage,
     #[error("External action outcome is unknown")]
@@ -401,7 +429,24 @@ pub fn normalized_from_engine(error: Error) -> NormalizedError {
         Error::Timeout => NormalizedError::Timeout,
         Error::RateLimited => NormalizedError::RateLimited {
             retry_after_secs: None,
+            detail: String::new(),
         },
+        // Round-trips with the provider's explanation intact, and keeps the
+        // rate-limit classification when that is what produced it. Sending this
+        // through the catch-all below would reduce a provider's own account of
+        // the fault to a bare invalid-response string.
+        Error::ProviderFault {
+            status: 429,
+            summary,
+        } => NormalizedError::RateLimited {
+            retry_after_secs: None,
+            detail: summary,
+        },
+        Error::ProviderFault { status, summary } => NormalizedError::ProviderError {
+            status,
+            detail: summary,
+        },
+        Error::Unreachable { detail } => NormalizedError::NetworkUnavailable { detail },
         Error::InvalidResponse => NormalizedError::InvalidResponse {
             detail: "provider response is invalid".into(),
         },
@@ -423,6 +468,15 @@ pub trait ModelProvider: Send + Sync {
     /// Providers that do not need an explicit local runtime are ready by default.
     fn is_available(&self) -> bool {
         true
+    }
+    /// The model this provider will actually call, when it knows.
+    ///
+    /// Carried so a fault can name the exact model that failed. Access is granted
+    /// per model, so "your key cannot use nvidia/nemotron-3.5-lightning-30b-a3b"
+    /// is something the user can act on where "the provider did not respond" is
+    /// not.
+    fn model(&self) -> &str {
+        ""
     }
     async fn infer(&self, context: ContextBundle) -> Result<AgentAction>;
     async fn infer_stream(
@@ -474,6 +528,19 @@ pub trait Store: PersonalizationStore + Send + Sync {
     fn events(&self, after: u64) -> Result<Vec<AssistantEvent>>;
     fn append_event(&self, event: &NewRunEvent) -> Result<()>;
     fn event_bounds(&self) -> Result<Option<EventBounds>>;
+    /// Records one internal action and the exact error behind it.
+    ///
+    /// A developer surface, separate from the user-facing event stream: it exists
+    /// so a fault can be traced after the fact without a debugger attached.
+    /// Implementations must not fail the caller when the write fails, since losing
+    /// a log line must never take down the action being logged.
+    fn record_diagnostic(&self, entry: &DiagnosticEntry) -> Result<()>;
+    /// Most recent diagnostics first, bounded so a device cannot be asked for
+    /// an unbounded read.
+    fn diagnostics(&self, limit: usize) -> Result<Vec<DiagnosticEntry>>;
+    /// Removes diagnostic entries older than `keep`, so the log cannot grow
+    /// without limit on a device that is rarely reinstalled.
+    fn prune_diagnostics(&self, keep: usize) -> Result<()>;
     fn setting(&self, key: &str) -> Result<Option<Value>>;
     fn set_setting(&self, key: &str, value: &Value) -> Result<()>;
     fn put_adaptive_rule(&self, rule: &AdaptiveRule) -> Result<()>;

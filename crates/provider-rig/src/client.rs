@@ -14,18 +14,36 @@ use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
 use crate::RigAdapterError;
 
+/// Bound on waiting for a provider to accept a request and start its reply.
+///
+/// Applied here rather than left to the engine's step deadline, for one reason: the
+/// engine reports a blown deadline as a bare "Operation timed out", which cannot
+/// distinguish a request that never left from one the provider took and then
+/// abandoned. Those have different fixes — a dead network versus a key without
+/// inference entitlement — and this is where the difference is still observable.
+///
+/// Sized below the engine's 30s step deadline so it surfaces first, with the fault
+/// named, instead of being flattened on the way out.
+const PROVIDER_FIRST_RESPONSE: std::time::Duration = std::time::Duration::from_secs(25);
+
+fn build_client(
+    base_url: &str,
+    raw_secret: &str,
+) -> Result<openai::CompletionsClient, RigAdapterError> {
+    openai::CompletionsClient::builder()
+        .api_key(raw_secret)
+        .base_url(base_url)
+        .build()
+        .map_err(|e| RigAdapterError::RequestFailed(e.to_string()))
+}
+
 pub async fn complete_openai_compatible(
     base_url: &str,
     raw_secret: &str,
     request: &ModelRequest,
 ) -> Result<ModelResponse, RigAdapterError> {
     let rig_request = build_rig_request(request)?;
-    let client = openai::Client::builder()
-        .api_key(raw_secret)
-        .base_url(base_url)
-        .build()
-        .map_err(|e| RigAdapterError::RequestFailed(e.to_string()))?
-        .completions_api();
+    let client = build_client(base_url, raw_secret)?;
     let model = client.completion_model(request.model.clone());
     let response = model
         .completion(rig_request)
@@ -41,12 +59,7 @@ pub async fn stream_openai_compatible(
     sink: &ProviderEventSink,
 ) -> Result<ModelResponse, RigAdapterError> {
     let rig_request = build_rig_request(request)?;
-    let client = openai::Client::builder()
-        .api_key(raw_secret)
-        .base_url(base_url)
-        .build()
-        .map_err(|e| RigAdapterError::RequestFailed(e.to_string()))?
-        .completions_api();
+    let client = build_client(base_url, raw_secret)?;
     let model = client.completion_model(request.model.clone());
     run_stream(model, rig_request, &request.model, sink).await
 }
@@ -57,7 +70,23 @@ pub(crate) async fn run_stream<M: CompletionModel>(
     model_id: &str,
     sink: &ProviderEventSink,
 ) -> Result<ModelResponse, RigAdapterError> {
-    let mut stream = model.stream(request).await.map_err(normalize_error)?;
+    // Bound the wait for the FIRST item, not just for the stream to open. A
+    // provider that accepts a request and then goes quiet still returns response
+    // headers promptly - it simply never sends a body - so a deadline around
+    // opening the stream expires in milliseconds and the real stall lands on the
+    // first read instead. Bounding only this first item keeps a long but
+    // progressing answer from being cut off, which bounding the whole exchange
+    // would do.
+    let deadline = tokio::time::Instant::now() + PROVIDER_FIRST_RESPONSE;
+    let mut stream = tokio::time::timeout_at(deadline, model.stream(request))
+        .await
+        .map_err(|_| RigAdapterError::Normalized(NormalizedError::NoResponse))?
+        .map_err(normalize_error)?;
+    // Read the first item here so it can be covered by the same deadline, then
+    // hand it to the loop below so the rest of the stream is unbounded.
+    let first = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| RigAdapterError::Normalized(NormalizedError::NoResponse))?;
     let mut content = String::new();
     let mut tool_calls = Vec::new();
     let mut tool_index = 0usize;
@@ -67,7 +96,11 @@ pub(crate) async fn run_stream<M: CompletionModel>(
         total_tokens: 0,
     };
     let mut finish_reason = FinishReason::Stop;
-    while let Some(item) = stream.next().await {
+    // The first item was already read under the deadline above, so it is handled
+    // here and the loop takes over from the second one onwards. Chained rather
+    // than duplicated so the two paths cannot drift apart.
+    let mut pending = first;
+    while let Some(item) = pending.take().or(stream.next().await) {
         let item = item.map_err(normalize_error)?;
         for delta in map_stream_item(&item, &mut tool_index) {
             match &delta {
@@ -341,6 +374,34 @@ pub(crate) fn normalize_error(error: rig_core::completion::CompletionError) -> R
     RigAdapterError::Normalized(map_completion_error(error))
 }
 
+/// Every layer of a transport failure, outermost first.
+///
+/// An HTTP client reports a failure to put a request on the wire with one
+/// uninformative wrapper phrase and hides the actual cause behind it. "Error
+/// sending request for url" names the URL and nothing else; the reason is one
+/// `source()` link deeper, and that link is the only place a certificate
+/// failure, a refused connection, and an unresolvable name can be told apart.
+/// Reading only the outermost message is what makes all three look identical.
+fn transport_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut current = error.source();
+    while let Some(cause) = current {
+        let text = cause.to_string();
+        // A repeated message adds nothing and signals a cycle worth breaking.
+        if parts.last().is_some_and(|last| last == &text) {
+            break;
+        }
+        parts.push(text);
+        current = cause.source();
+        // Bounded because a deep chain is a bug worth truncating, not worth
+        // letting a provider's behaviour decide how much memory a log line uses.
+        if parts.len() >= 8 {
+            break;
+        }
+    }
+    parts.join(": ")
+}
+
 fn map_completion_error(error: rig_core::completion::CompletionError) -> NormalizedError {
     use rig_core::completion::CompletionError;
     use rig_core::http_client::Error as HttpError;
@@ -362,21 +423,36 @@ fn map_completion_error(error: rig_core::completion::CompletionError) -> Normali
             map_status(status.as_u16(), retry_after, body)
         }
         CompletionError::HttpError(HttpError::Instance(inner)) => {
-            map_transport_failure(&inner.to_string())
+            map_transport_failure(&transport_chain(inner.as_ref()))
         }
         CompletionError::HttpError(other) => NormalizedError::InvalidResponse {
-            detail: other.to_string(),
+            detail: transport_chain(&other),
         },
-        CompletionError::ProviderResponse(error) => match error.status {
-            Some(status) => map_status(status.as_u16(), None, error.body),
-            None => NormalizedError::ProviderError {
-                status: 0,
-                detail: error.body,
-            },
-        },
-        CompletionError::ResponseError(detail) | CompletionError::ProviderError(detail) => {
-            NormalizedError::ProviderError { status: 0, detail }
+        CompletionError::ProviderResponse(error) => {
+            let status = error
+                .status
+                .map(|status| status.as_u16())
+                .filter(|status| *status >= 400)
+                .or_else(|| embedded_error_status(&error.body));
+            match status {
+                Some(status) => map_status(status, None, error.body),
+                // A response arrived, so the provider did say something — we just
+                // could not read a status off it. Its words are still its words and
+                // still worth showing.
+                None => NormalizedError::ProviderError {
+                    status: 0,
+                    detail: provider_text(&error.body),
+                },
+            }
         }
+        CompletionError::ResponseError(detail) => NormalizedError::InvalidResponse { detail },
+        // Carries no HTTP response, so nothing reached us to report and nothing
+        // said anything to us. That makes it a transport fault, and the request
+        // may never have left the device — attributing it to the provider would
+        // put a raw client-library string on screen as though the provider had
+        // said it, and would point the user at their provider rather than at
+        // their network.
+        CompletionError::ProviderError(detail) => map_transport_failure(&detail),
         CompletionError::RequestError(_) | CompletionError::JsonError(_) => {
             NormalizedError::InvalidResponse {
                 detail: error.to_string(),
@@ -388,6 +464,14 @@ fn map_completion_error(error: rig_core::completion::CompletionError) -> Normali
     }
 }
 
+fn embedded_error_status(body: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = value.pointer("/error/code")?.as_u64()?;
+    u16::try_from(code)
+        .ok()
+        .filter(|status| (400..=599).contains(status))
+}
+
 fn map_status(status: u16, retry_after_secs: Option<u64>, detail: String) -> NormalizedError {
     match status {
         401 => NormalizedError::AuthenticationFailed,
@@ -395,19 +479,113 @@ fn map_status(status: u16, retry_after_secs: Option<u64>, detail: String) -> Nor
         // Providers answer 404 for an unknown model and 410 Gone for one that
         // has been retired. Both mean the caller must choose a different model.
         404 | 410 => NormalizedError::ModelNotFound,
-        429 => NormalizedError::RateLimited { retry_after_secs },
-        500..=599 => NormalizedError::ProviderError { status, detail },
-        _ => NormalizedError::ProviderError { status, detail },
+        // The provider's own words are kept here because a limit is not a status
+        // code. Only the provider knows whether this clears in a minute or
+        // tomorrow, and whether credits, a plan, or a daily ceiling is what ran
+        // out. Dropping that turns "add 10 credits" into "try again later".
+        429 => NormalizedError::RateLimited {
+            retry_after_secs,
+            detail: provider_text(&detail),
+        },
+        // Everything else the provider rejected or failed is reported as itself,
+        // with its explanation intact. Folding these into a single lossy category
+        // is what made a 400 — the provider refusing to parse the request — read
+        // to the user as though the provider were unreachable.
+        _ => NormalizedError::ProviderError {
+            status,
+            detail: provider_text(&detail),
+        },
     }
 }
 
+/// The provider's own account of a fault, in the words it used.
+///
+/// Providers disagree about where they put this, so the common shapes are tried
+/// in turn before falling back to the raw body. Returning the raw body last
+/// matters: an unrecognised shape is still the provider's own words, and showing
+/// them beats inventing a summary that is wrong.
+fn provider_text(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let value: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return assistant_contracts::blocker::bounded_detail(trimmed),
+    };
+    // `remedy_hint` is where providers put the action a user can take, and it is
+    // often absent from the headline message, so it is appended when present.
+    let remedy = value
+        .pointer("/error/metadata/remedy_hint")
+        .and_then(serde_json::Value::as_str);
+    let headline = ["/error/message", "/message", "/detail", "/error"]
+        .into_iter()
+        .find_map(|pointer| match value.pointer(pointer) {
+            Some(serde_json::Value::String(text)) => Some(text.as_str()),
+            _ => None,
+        });
+    let text = match headline {
+        Some(headline) => match remedy {
+            // The provider wrote these as two sentences and did not punctuate
+            // between them. Left as-is they run together into one garbled
+            // sentence, which undoes the clarity being preserved here. A headline
+            // that already ends in punctuation is left alone, so a full stop does
+            // not become two.
+            Some(remedy) if !remedy.trim().is_empty() => {
+                if headline.trim_end().ends_with(['.', '!', '?', ':']) {
+                    format!("{headline} {remedy}")
+                } else {
+                    format!("{headline}. {remedy}")
+                }
+            }
+            _ => headline.to_owned(),
+        },
+        None => trimmed.to_owned(),
+    };
+    assistant_contracts::blocker::bounded_detail(text.trim())
+}
+
+/// Whether a transport failure was our own request deadline expiring.
+///
+/// Matched on the wording because `reqwest` reports an expired deadline as a
+/// boxed error rather than a distinct variant, and connecting a timeout to DNS
+/// or to a refused connection would be wrong. `connect_timeout` is deliberately
+/// excluded: a host that never accepts the connection never took the request, so
+/// that case really is unreachable rather than unanswered.
+fn is_request_timeout(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    // Wording that names the connection itself means the request was never
+    // delivered, which is an unreachable host and not a provider that went quiet.
+    if lowered.contains("operation timed out")
+        || lowered.contains("connect timeout")
+        || lowered.contains("connection timed out")
+    {
+        return false;
+    }
+    lowered.contains("timed out") || lowered.contains("timeout")
+}
+
 fn map_transport_failure(message: &str) -> NormalizedError {
+    // Kept in full, because this is the only place the reason exists. A
+    // connectivity fault that reports only "unreachable" cannot be told apart
+    // from a certificate that will not validate or a proxy that intercepts, and
+    // those have nothing in common but the inability to answer.
+    let detail = assistant_contracts::blocker::bounded_detail(message);
+    // An expired request deadline is not a dropped connection. The request was
+    // already delivered and the provider chose not to answer, which is what an
+    // account without inference entitlement looks like from the client side: the
+    // connection stays open and nothing ever comes back. Checked before the shared
+    // classifier so it is not flattened into a generic network fault, which would
+    // point the user at their Wi-Fi.
+    if is_request_timeout(message) {
+        return NormalizedError::NoResponse;
+    }
     match ConnectionTestService::classify_connection_error(message) {
         NormalizedTestFailure::Credential => NormalizedError::AuthenticationFailed,
         NormalizedTestFailure::Endpoint => NormalizedError::EndpointNotFound,
         NormalizedTestFailure::ModelNotFound => NormalizedError::ModelNotFound,
         NormalizedTestFailure::Quota => NormalizedError::QuotaExceeded,
-        NormalizedTestFailure::Network => NormalizedError::NetworkUnavailable,
+        NormalizedTestFailure::Network => NormalizedError::NetworkUnavailable { detail },
         NormalizedTestFailure::ProviderError | NormalizedTestFailure::Unknown => {
             NormalizedError::ProviderError {
                 status: 0,
@@ -622,8 +800,31 @@ mod tests {
         assert_eq!(
             map_status(429, Some(60), String::new()),
             NormalizedError::RateLimited {
-                retry_after_secs: Some(60)
+                retry_after_secs: Some(60),
+                detail: String::new(),
             }
+        );
+    }
+
+    /// A provider that explained its limit explained it in a way no status code
+    /// can reproduce, so the explanation has to survive normalization.
+    #[test]
+    fn an_in_band_error_code_normalizes_and_keeps_the_providers_reason() {
+        let body = r#"{"error":{"code":429,"message":"free-models-per-day: add 10 credits"}}"#;
+        let error = rig_core::completion::CompletionError::ProviderResponse(
+            rig_core::ProviderResponseError::without_status(body),
+        );
+        assert_eq!(
+            map_completion_error(error),
+            NormalizedError::RateLimited {
+                retry_after_secs: None,
+                detail: "free-models-per-day: add 10 credits".into(),
+            }
+        );
+        assert_eq!(embedded_error_status(body), Some(429));
+        assert_eq!(
+            embedded_error_status(r#"{"error":{"code":"server_error"}}"#),
+            None
         );
     }
 
@@ -635,11 +836,260 @@ mod tests {
         );
     }
 
+    /// Taken from a real provider reply. The remedy was in `metadata`, not in the
+    /// headline message, and it is the part that tells the user what to do.
     #[test]
-    fn timeout_maps_to_network_unavailable() {
+    fn a_providers_limit_is_read_from_the_shape_it_actually_sends() {
+        let body = r#"{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429,"metadata":{"headers":{"X-RateLimit-Reset":"1790726400000"},"limit_source":"openrouter_free_tier_daily","remedy_hint":"Wait for the daily reset (see X-RateLimit-Reset), or purchase credits to raise your free model daily limit."}}}"#;
         assert_eq!(
-            map_transport_failure("request timed out"),
-            NormalizedError::NetworkUnavailable
+            map_status(429, None, body.to_owned()),
+            NormalizedError::RateLimited {
+                retry_after_secs: None,
+                detail: "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day. Wait for the daily reset (see X-RateLimit-Reset), or purchase credits to raise your free model daily limit.".into(),
+            }
+        );
+    }
+
+    /// A provider that names the parameter it refused has diagnosed the problem
+    /// better than a status code can, so the refusal is reported as itself.
+    #[test]
+    fn a_rejected_request_keeps_the_providers_objection() {
+        let body =
+            r#"{"error":{"message":"'temperature' is not supported by this model","code":400}}"#;
+        assert_eq!(
+            map_status(400, None, body.to_owned()),
+            NormalizedError::ProviderError {
+                status: 400,
+                detail: "'temperature' is not supported by this model".into(),
+            }
+        );
+    }
+
+    /// The shapes providers actually use, plus a body that is not JSON at all.
+    #[test]
+    fn the_providers_own_words_survive_every_common_shape() {
+        for (body, expected) in [
+            (
+                r#"{"error":{"message":"from error.message"}}"#,
+                "from error.message",
+            ),
+            (r#"{"message":"from message"}"#, "from message"),
+            (r#"{"detail":"from detail"}"#, "from detail"),
+            (
+                r#"{"error":"from error as a string"}"#,
+                "from error as a string",
+            ),
+            ("plain text failure", "plain text failure"),
+        ] {
+            assert_eq!(provider_text(body), expected, "body was {body}");
+        }
+        // An unrecognised JSON shape still yields the provider's own bytes rather
+        // than a summary nobody wrote.
+        assert!(provider_text(r#"{"unexpected":{"nested":"value"}}"#).contains("nested"));
+        assert_eq!(provider_text("   "), "");
+    }
+
+    /// Two sentences the provider wrote separately must not be welded into one.
+    #[test]
+    fn a_remedy_hint_is_joined_as_a_sentence() {
+        let with_remedy = r#"{"error":{"message":"Limit reached for today.","metadata":{"remedy_hint":"Add credits."}}}"#;
+        assert_eq!(
+            provider_text(with_remedy),
+            "Limit reached for today. Add credits."
+        );
+        // An unpunctuated headline gains the full stop rather than running on.
+        let unpunctuated =
+            r#"{"error":{"message":"Limit reached","metadata":{"remedy_hint":"Add credits."}}}"#;
+        assert_eq!(provider_text(unpunctuated), "Limit reached. Add credits.");
+        // A headline that already ends in a full stop must not gain a second.
+        let already = r#"{"error":{"message":"Done.","metadata":{"remedy_hint":"Now retry."}}}"#;
+        assert_eq!(provider_text(already), "Done. Now retry.");
+        // No remedy, nothing invented.
+        let bare = r#"{"error":{"message":"Limit reached"}}"#;
+        assert_eq!(provider_text(bare), "Limit reached");
+    }
+
+    /// The distinction that keeps a fault honest: a fault the provider described
+    /// is the provider's fault, and a failure to reach one at all is not.
+    ///
+    /// Found on a real device: a dropped connection surfaced as
+    /// "openrouter reported: Http client error: error sending request for url",
+    /// which reads as though the provider had answered and blames the provider for
+    /// something that never got off the device.
+    #[test]
+    fn a_failure_to_reach_a_provider_is_not_attributed_to_that_provider() {
+        let error = rig_core::completion::CompletionError::ProviderError(
+            "Http client error: error sending request for url (https://example.invalid/v1/chat/completions)"
+                .into(),
+        );
+        let normalized = map_completion_error(error);
+        // The reason survives - that is the point of carrying it - but it is
+        // reachable only through the transport channel, never through
+        // `provider_text`, which is reserved for words a provider actually sent.
+        assert!(
+            !normalized
+                .provider_text()
+                .is_some_and(|text| text.contains("error sending request")),
+            "a client-library string must never be shown as a provider's own words, got {normalized:?}"
+        );
+        assert!(
+            matches!(
+                normalized,
+                NormalizedError::NetworkUnavailable { .. }
+            ),
+            "a request that never reached the provider is an unreachable provider, not a provider that spoke, got {normalized:?}"
+        );
+        assert!(
+            normalized
+                .reason_text()
+                .is_some_and(|text| text.contains("error sending request for url")),
+            "the transport reason must be retained for the action log, got {normalized:?}"
+        );
+    }
+
+    /// A response that arrived without a readable status is still the provider
+    /// replying, so its words are kept rather than reclassified as a dead network.
+    #[test]
+    fn a_response_without_a_readable_status_keeps_the_providers_words() {
+        let body = r#"{"detail":"gateway returned an unrecognised body"}"#;
+        let error = rig_core::completion::CompletionError::ProviderResponse(
+            rig_core::ProviderResponseError::without_status(body),
+        );
+        assert_eq!(
+            map_completion_error(error),
+            NormalizedError::ProviderError {
+                status: 0,
+                detail: "gateway returned an unrecognised body".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_deep_error_chain_is_read_to_its_root_not_just_its_wrapper() {
+        // Mirrors how an HTTP client reports a failure: an uninformative outer
+        // phrase with the real cause one link deeper. Reading only the outer
+        // message is what leaves a certificate failure looking like any other.
+        #[derive(Debug)]
+        struct Root;
+        impl std::fmt::Display for Root {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("invalid peer certificate: unable to get local issuer")
+            }
+        }
+        impl std::error::Error for Root {}
+        #[derive(Debug)]
+        struct Middle(Root);
+        impl std::fmt::Display for Middle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl std::error::Error for Middle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        #[derive(Debug)]
+        struct Outer(Middle);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request for url (https://example.invalid)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let chained = transport_chain(&Outer(Middle(Root)));
+        assert!(chained.contains("error sending request for url"));
+        assert!(
+            chained.contains("unable to get local issuer"),
+            "the root cause must survive, got: {chained}"
+        );
+        // Both layers are present, so a reader can see the symptom and the cause
+        // rather than having to guess which one the classifier acted on.
+        assert!(chained.contains("client error (Connect)"));
+    }
+
+    #[test]
+    fn a_repeated_message_does_not_loop_forever() {
+        #[derive(Debug)]
+        struct Loop;
+        impl std::fmt::Display for Loop {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("same")
+            }
+        }
+        impl std::error::Error for Loop {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self)
+            }
+        }
+        assert_eq!(transport_chain(&Loop), "same");
+    }
+
+    /// A provider echoing a prompt back inside its error must not be able to grow
+    /// the fault text without bound, and the cut must be visible rather than
+    /// silently presenting a partial sentence as the provider's whole reason.
+    #[test]
+    fn an_oversized_providers_message_is_bounded_and_says_so() {
+        let limit = assistant_contracts::blocker::DIAGNOSTIC_DETAIL_LIMIT;
+        let body = serde_json::json!({ "error": { "message": "x".repeat(9_000) } }).to_string();
+        let text = provider_text(&body);
+        assert!(
+            text.len() <= limit + "... (truncated)".len(),
+            "grew to {} bytes",
+            text.len()
+        );
+        assert!(text.ends_with("... (truncated)"));
+    }
+
+    /// A connection that was never established is a network fault, and stays one.
+    #[test]
+    fn an_unestablished_connection_is_still_reported_as_the_network() {
+        for message in [
+            "operation timed out",
+            "connect timeout",
+            "connection timed out",
+        ] {
+            assert_eq!(
+                map_transport_failure(message),
+                NormalizedError::NetworkUnavailable {
+                    detail: message.into(),
+                },
+                "{message} never reached the provider, so it is not a silent provider"
+            );
+        }
+    }
+
+    /// A request deadline expiring means the connection was established and the
+    /// request delivered, with no reply. Reported as itself.
+    ///
+    /// Found on a device: NVIDIA accepted the request with a valid key and held
+    /// the connection open without replying, and the user was told to check their
+    /// network — which the same request had already proven was fine.
+    #[test]
+    fn an_expired_request_deadline_is_a_provider_that_went_quiet() {
+        assert_eq!(
+            map_transport_failure("operation error: request timed out"),
+            NormalizedError::NoResponse
+        );
+        assert_eq!(
+            map_transport_failure("error sending request for url (...): timeout"),
+            NormalizedError::NoResponse
+        );
+    }
+
+    /// The quiet-provider fault must not send the turn to a fallback provider: the
+    /// request arrived, so a different key would be ignored the same way, and
+    /// switching would hide a setup mistake behind a working-looking answer.
+    #[test]
+    fn a_quiet_provider_never_fails_over() {
+        assert!(
+            !assistant_contracts::failover::may_fail_over(&NormalizedError::NoResponse),
+            "a provider that took the request and went quiet is not a reason to try someone else"
         );
     }
 

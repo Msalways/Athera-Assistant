@@ -146,7 +146,11 @@ export interface ConnectionTestOutcome {
 export async function testProviderConnection(
   provider_id: string,
 ): Promise<ConnectionTestOutcome> {
-  return command<ConnectionTestOutcome>("test_provider_connection", {
-    provider_id,
-  });
+  return command<ConnectionTestOutcome>(
+    "test_provider_connection",
+    {
+      provider_id,
+    },
+    { timeoutMs: 125000 },
+  );
 }

@@ -1560,3 +1560,229 @@ async fn recovered_graph_revalidates_current_tool_spec_before_execution() {
         WorkNodeState::Failed
     );
 }
+
+/// A provider that accepts requests and never answers must be named as such, not
+/// as a timeout, and must not be retried. Found on a real device: the request
+/// left with a valid key and NVIDIA held the connection open without replying, so
+/// the user was told to check their network when connectivity had already been
+/// proven by the same request arriving.
+#[tokio::test]
+async fn a_silent_provider_is_named_and_not_retried() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let cloud = Arc::new(ScriptedProvider::failing(false, Error::ProviderSilent));
+    // The fast tier fails too, so the turn reaches the cloud and the silent
+    // provider is the thing that ends it. With a working fast tier the local model
+    // answers and the cloud is never asked.
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::failing(true, Error::Unavailable)),
+        cloud,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let finished = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(finished.status, TaskStatus::Failed);
+    assert!(
+        finished.message.contains("never replied"),
+        "must name the fault, got: {}",
+        finished.message
+    );
+    assert!(
+        !finished.message.contains("timed out"),
+        "a silent provider is not a timeout, got: {}",
+        finished.message
+    );
+    // Naming the model is what makes it actionable: access is granted per model.
+    assert!(
+        finished.message.contains("scripted/model-v1"),
+        "must name the model, got: {}",
+        finished.message
+    );
+    // Exactly one attempt at the silent provider, not three. The fault repeats
+    // identically, so repeating it only turns one clear message into a long wait.
+    // Counted from the log rather than the task's counter, because the fast tier's
+    // own failure also increments that.
+    let silent_attempts = store
+        .diagnostics(50)
+        .unwrap()
+        .iter()
+        .filter(|e| e.category == "provider_request" && e.outcome == "no_response")
+        .count();
+    assert_eq!(silent_attempts, 1, "a silent provider must be tried once");
+
+    let blocker = store.task_blocker(task.id).unwrap().unwrap();
+    assert!(
+        matches!(blocker, TaskBlocker::ProviderNotAnswering { .. }),
+        "must be recorded as its own blocker, got {blocker:?}"
+    );
+}
+
+/// A provider that explains its limit has diagnosed the problem better than any
+/// status code can, and the user can only act on the explanation. Found on a real
+/// device: OpenRouter answered `429 free-models-per-day` with "Add 10 credits to
+/// unlock 1000 free model requests per day", and Athera replaced that with "try a
+/// new task after its retry window" — advice that cannot work against a daily
+/// quota, and that named nothing the user could change.
+#[tokio::test]
+async fn a_providers_own_account_of_a_limit_is_what_the_user_is_told() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let explanation =
+        "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day";
+    let cloud = Arc::new(ScriptedProvider::failing(
+        false,
+        Error::ProviderFault {
+            status: 429,
+            summary: explanation.into(),
+        },
+    ));
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::failing(true, Error::Unavailable)),
+        cloud,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let finished = assistant.run(task.id).await.unwrap();
+
+    assert_eq!(finished.status, TaskStatus::Failed);
+    assert!(
+        finished.message.contains(explanation),
+        "must carry the provider's explanation, got: {}",
+        finished.message
+    );
+    assert!(
+        finished.message.contains("429"),
+        "must carry the status, which is the one fact the provider did not state, got: {}",
+        finished.message
+    );
+    // The generic sentence this replaces is not merely vaguer, it is wrong: it
+    // sends someone to retry against a quota that resets tomorrow.
+    assert!(
+        !finished.message.contains("retry window"),
+        "must not advise retrying a daily limit, got: {}",
+        finished.message
+    );
+    // The exact text is also recorded, so a fault that is later questioned can be
+    // checked against what the provider actually said.
+    let logged = store.diagnostics(50).unwrap().into_iter().any(|entry| {
+        entry.outcome == "provider_fault" && entry.detail.contains("free-models-per-day")
+    });
+    assert!(logged, "the provider's exact words must be recorded");
+}
+
+/// A limit is refused, not retried. Repeating it burns the quota that is already
+/// exhausted and delays the message that says what to do.
+#[tokio::test]
+async fn a_provider_that_refused_the_request_is_not_asked_three_times() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let cloud = Arc::new(ScriptedProvider::failing(
+        false,
+        Error::ProviderFault {
+            status: 400,
+            summary: "'temperature' is not supported by this model".into(),
+        },
+    ));
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::failing(true, Error::Unavailable)),
+        cloud,
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let finished = assistant.run(task.id).await.unwrap();
+
+    assert!(
+        finished.message.contains("not supported"),
+        "must carry the refusal, got: {}",
+        finished.message
+    );
+    let refusals = store
+        .diagnostics(50)
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.outcome == "provider_fault")
+        .count();
+    assert_eq!(
+        refusals, 1,
+        "a deterministic refusal must be asked once, not three times"
+    );
+}
+
+/// The log is the point of the change: it has to show the attempt as well as the
+/// failure, because an entry that stops at `started` is how a request that went
+/// out and never returned is identified after the fact.
+#[tokio::test]
+async fn the_action_log_records_the_attempt_and_the_exact_error() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::failing(true, Error::Unavailable)),
+        Arc::new(ScriptedProvider::failing(false, Error::ProviderSilent)),
+        Arc::new(EchoExecutor),
+        EngineConfig::default(),
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    assistant.run(task.id).await.unwrap();
+
+    let log = store.diagnostics(50).unwrap();
+    assert!(
+        log.iter()
+            .any(|e| e.outcome == "started" && e.category == "provider_request"),
+        "the attempt itself must be recorded"
+    );
+    assert!(
+        log.iter().any(|e| e.outcome == "no_response"),
+        "the silent provider must be recorded as such, not as a generic failure"
+    );
+
+    // Matched on the error's own wording rather than its variant name: the log
+    // stores what the user would be shown, which is the thing worth reading back.
+    let failure = log
+        .iter()
+        .find(|e| e.outcome == "failed" && e.detail.contains("never replied"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the exact error must be recorded. log was: {:#?}",
+                log.iter()
+                    .map(|e| format!("{}/{}: {}", e.category, e.outcome, e.detail))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(failure.task_id, Some(task.id));
+    // The attempt carries which turn and which try it was, which is what makes a
+    // bare "started" entry readable as "this one never came back".
+    let attempt = log
+        .iter()
+        .find(|e| e.outcome == "started" && e.detail.contains("scripted/model-v1"))
+        .expect("the attempt must name the model");
+    assert!(attempt.detail.contains("attempt="));
+}
+
+/// A long but progressing answer must not be cut off. The deadline bounds waiting
+/// for the stream to open, not the whole exchange.
+#[tokio::test]
+async fn a_slow_but_successful_provider_still_completes() {
+    let store = Arc::new(SqliteStore::memory().unwrap());
+    let assistant = Assistant::new(
+        store.clone(),
+        Arc::new(ScriptedProvider::new(true, vec![respond()])),
+        Arc::new(ScriptedProvider::new(false, vec![respond()])),
+        Arc::new(EchoExecutor),
+        EngineConfig {
+            timeout_seconds: 120,
+            ..EngineConfig::default()
+        },
+    );
+    let task = assistant.submit(input(InputSource::Text)).unwrap();
+    let finished = assistant.run(task.id).await.unwrap();
+    assert_eq!(finished.status, TaskStatus::Completed);
+    assert!(store
+        .diagnostics(50)
+        .unwrap()
+        .iter()
+        .any(|e| e.outcome == "ok"));
+}

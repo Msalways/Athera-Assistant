@@ -126,6 +126,17 @@ impl SqliteStore {
             tx.execute_batch(include_str!("../../../migrations/011_local_probes.sql"))
                 .map_err(|_| Error::Storage)?;
         }
+        if !tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=12)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(|_| Error::Storage)?
+        {
+            tx.execute_batch(include_str!("../../../migrations/012_diagnostics.sql"))
+                .map_err(|_| Error::Storage)?;
+        }
         tx.execute(
             "UPDATE messages SET status='interrupted' WHERE status='generating'",
             [],
@@ -160,6 +171,7 @@ pub(crate) fn blocker_kind(blocker: &TaskBlocker) -> &'static str {
         TaskBlocker::CapabilityUnavailable { .. } => "capability_unavailable",
         TaskBlocker::ReasoningUnavailable { .. } => "reasoning_unavailable",
         TaskBlocker::HeldOnDevice { .. } => "held_on_device",
+        TaskBlocker::ProviderNotAnswering { .. } => "provider_not_answering",
     }
 }
 
@@ -932,6 +944,65 @@ impl Store for SqliteStore {
                 event.worker_id.map(|id| id.to_string()),
                 event.text_delta
             ],
+        )
+        .map_err(|_| Error::Storage)?;
+        Ok(())
+    }
+
+    fn record_diagnostic(&self, entry: &DiagnosticEntry) -> Result<()> {
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        conn.execute(
+            "INSERT INTO diagnostics(created_at,task_id,category,subject,outcome,detail) VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                entry.created_at,
+                entry.task_id.map(|id| id.to_string()),
+                entry.category,
+                entry.subject,
+                entry.outcome,
+                bounded_detail(&entry.detail),
+            ],
+        )
+        .map_err(|_| Error::Storage)?;
+        Ok(())
+    }
+
+    fn diagnostics(&self, limit: usize) -> Result<Vec<DiagnosticEntry>> {
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT sequence,created_at,task_id,category,subject,outcome,detail \
+                 FROM diagnostics ORDER BY sequence DESC LIMIT ?1",
+            )
+            .map_err(|_| Error::Storage)?;
+        let rows = stmt
+            .query_map([limit.min(500) as i64], |row| {
+                Ok(DiagnosticEntry {
+                    sequence: row.get(0)?,
+                    created_at: row.get(1)?,
+                    task_id: row
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|id| assistant_contracts::Id::parse_str(&id).ok()),
+                    category: row.get(3)?,
+                    subject: row.get(4)?,
+                    outcome: row.get(5)?,
+                    detail: row.get(6)?,
+                })
+            })
+            .map_err(|_| Error::Storage)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row.map_err(|_| Error::Storage)?);
+        }
+        Ok(entries)
+    }
+
+    fn prune_diagnostics(&self, keep: usize) -> Result<()> {
+        let conn = self.connection.lock().map_err(|_| Error::Storage)?;
+        // Bounded by count rather than age: the useful entries are the recent
+        // ones, and a device that is never reinstalled must not accumulate them.
+        conn.execute(
+            "DELETE FROM diagnostics WHERE sequence <= (SELECT MAX(sequence) FROM diagnostics) - ?1",
+            [keep.min(5_000) as i64],
         )
         .map_err(|_| Error::Storage)?;
         Ok(())

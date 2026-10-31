@@ -135,7 +135,7 @@ export interface Settings {
     id: string;
     name: string;
     url: string;
-    transport: "streamable_http";
+    transport: "streamable_http" | "legacy_sse";
     authentication:
       | "none"
       | { kind: "none" }
@@ -160,6 +160,17 @@ export interface BuildInfo {
 export interface FailoverMember {
   provider_id: string;
   display_name: string;
+}
+
+/** One entry in the developer action log. Mirrors DiagnosticEntry in Rust. */
+export interface DiagnosticEntry {
+  sequence: number;
+  created_at: number;
+  task_id: string | null;
+  category: string;
+  subject: string;
+  outcome: string;
+  detail: string;
 }
 
 export interface LocalShadowState {

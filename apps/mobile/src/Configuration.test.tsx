@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
-import { Configuration } from "./Configuration";
+import { Configuration, mcpUrlProblem } from "./Configuration";
 import { command } from "./service";
 import type { Snapshot } from "./types";
 
@@ -319,6 +319,61 @@ it("passes a bearer credential through the dedicated session-only command", asyn
   );
 });
 
+it("connects Composio with its consumer key header", async () => {
+  const act = vi.fn().mockResolvedValue(true);
+  render(<Configuration snapshot={snapshot} view="connections" act={act} />);
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "Composio" },
+  });
+  fireEvent.change(screen.getByLabelText("Server URL"), {
+    target: { value: "https://connect.composio.dev/mcp" },
+  });
+  fireEvent.change(screen.getByLabelText("Authentication"), {
+    target: { value: "api_key_header" },
+  });
+  fireEvent.change(screen.getByLabelText("API key header"), {
+    target: { value: "x-consumer-api-key" },
+  });
+  fireEvent.change(screen.getByLabelText(/^Credential/), {
+    target: { value: "fixture-secret" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  await waitFor(() =>
+    expect(act).toHaveBeenCalledWith("connect_mcp_with_credential", {
+      connection: expect.objectContaining({
+        name: "Composio",
+        url: "https://connect.composio.dev/mcp",
+        authentication: expect.objectContaining({
+          kind: "api_key_header",
+          header: "x-consumer-api-key",
+        }),
+      }),
+      secret: "fixture-secret",
+    }),
+  );
+});
+
+it("passes an explicitly selected legacy SSE transport to Rust", async () => {
+  const act = vi.fn().mockResolvedValue(true);
+  render(<Configuration snapshot={snapshot} view="connections" act={act} />);
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "Older MCP" },
+  });
+  fireEvent.change(screen.getByLabelText("Server URL"), {
+    target: { value: "https://mcp.example.com/sse" },
+  });
+  fireEvent.change(screen.getByLabelText("Transport"), {
+    target: { value: "legacy_sse" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  await waitFor(() =>
+    expect(act).toHaveBeenCalledWith(
+      "connect_mcp",
+      expect.objectContaining({ transport: "legacy_sse" }),
+    ),
+  );
+});
+
 it("starts generic OAuth discovery without putting a token in settings", async () => {
   vi.mocked(command).mockImplementation(async (name) => {
     if (name === "authorize_connection")
@@ -505,4 +560,18 @@ it("shows byte progress and cancels a user-started model setup", async () => {
   await waitFor(() =>
     expect(command).toHaveBeenCalledWith("cancel_model_download", {}),
   );
+});
+
+it("explains a refused connection address instead of failing silently", () => {
+  // Found on the emulator: tapping Connect with a reachable http:// server
+  // produced no connection, no message, and a button that looked broken. The
+  // runtime only reports a normalized "Invalid input", so the reason has to be
+  // named where the address is typed.
+  expect(mcpUrlProblem("")).toMatch(/enter the address/i);
+  expect(mcpUrlProblem("not an address")).toMatch(/valid address/i);
+  expect(mcpUrlProblem("http://127.0.0.1:19100/mcp")).toMatch(/use https/i);
+  expect(mcpUrlProblem("https://localhost:19100/mcp")).toMatch(
+    /this device, not the computer/i,
+  );
+  expect(mcpUrlProblem("https://mcp.example.com/mcp")).toBeNull();
 });

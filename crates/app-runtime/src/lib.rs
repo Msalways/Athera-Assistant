@@ -373,6 +373,11 @@ impl Runtime {
         self.refresh_cloud_provider().await
     }
 
+    /// Restores a static MCP key from the platform vault without serializing it.
+    pub fn restore_mcp_key(&self, config: &ConnectionConfig, key: String) -> Result<()> {
+        self.secrets.set_mcp(config, key)
+    }
+
     fn next_step_suggestions(&self, tasks: &[Task]) -> Vec<serde_json::Value> {
         let mut suggestions = Vec::new();
         for task in tasks.iter().filter(|task| !task.status.terminal()).take(3) {
@@ -431,6 +436,11 @@ impl Runtime {
             // offer to connect one.
             TaskBlocker::ReasoningUnavailable { .. } => "No model provider is reachable",
             TaskBlocker::HeldOnDevice { .. } => "Kept on this device",
+            // Not fixed by connecting a service either: the provider answered with
+            // silence, so the action belongs in the key, not in a connection.
+            TaskBlocker::ProviderNotAnswering { .. } => {
+                "The provider accepted the request but did not reply"
+            }
         };
         (
             "connect_service",
@@ -441,13 +451,25 @@ impl Runtime {
     }
 
     async fn connection_state(&self, config: &ConnectionConfig) -> Result<ConnectionState> {
+        let live = self.mcp.is_connected(&config.id).await;
         let (state, granted_scopes, expires_at, message) = match &config.authentication {
-            McpAuthentication::None => (
-                ConnectionStatus::Connected,
-                vec![],
-                None,
-                "No credential required.".into(),
-            ),
+            McpAuthentication::None => {
+                if live {
+                    (
+                        ConnectionStatus::Connected,
+                        vec![],
+                        None,
+                        "MCP session active.".into(),
+                    )
+                } else {
+                    (
+                        ConnectionStatus::Unavailable,
+                        vec![],
+                        None,
+                        "MCP session is not active. Tap reconnect.".into(),
+                    )
+                }
+            }
             McpAuthentication::OauthAuthorizationCode {
                 requested_scopes, ..
             } => {
@@ -471,9 +493,13 @@ impl Runtime {
                             ConnectionStatus::Connecting,
                             format!("Finish connecting {} in your browser.", config.name),
                         ),
-                        OAuthState::Connected => (
+                        OAuthState::Connected if live => (
                             ConnectionStatus::Connected,
-                            format!("{} is connected.", config.name),
+                            format!("{} MCP session is active.", config.name),
+                        ),
+                        OAuthState::Connected => (
+                            ConnectionStatus::Unavailable,
+                            format!("{} is authorized but its MCP session is not active. Tap reconnect.", config.name),
                         ),
                         OAuthState::Expired => (
                             ConnectionStatus::Expired,
@@ -509,12 +535,16 @@ impl Runtime {
             }
             McpAuthentication::BearerToken { .. } | McpAuthentication::ApiKeyHeader { .. } => {
                 if self.secrets.contains_mcp(config) {
-                    (
-                        ConnectionStatus::Connected,
-                        vec![],
-                        None,
-                        format!("{} credential is configured.", config.name),
-                    )
+                    if live {
+                        (
+                            ConnectionStatus::Connected,
+                            vec![],
+                            None,
+                            format!("{} MCP session is active.", config.name),
+                        )
+                    } else {
+                        (ConnectionStatus::Unavailable, vec![], None, format!("{} credential is ready, but its MCP session is not active. Tap reconnect.", config.name))
+                    }
                 } else {
                     (
                         ConnectionStatus::Required,
@@ -655,6 +685,18 @@ impl Runtime {
             "next_step_suggestions" => {
                 let tasks = self.store.tasks()?;
                 Ok(serde_json::json!(self.next_step_suggestions(&tasks)))
+            }
+            "diagnostics" => {
+                // A developer surface, deliberately readable without a debugger.
+                // Capped here as well as in the store so an unbounded limit in a
+                // payload cannot ask the device for an unbounded read.
+                let limit = payload["limit"].as_u64().unwrap_or(200) as usize;
+                let entries = self.store.diagnostics(limit)?;
+                Ok(serde_json::to_value(entries).map_err(|_| Error::Storage)?)
+            }
+            "clear_diagnostics" => {
+                self.store.prune_diagnostics(0)?;
+                Ok(serde_json::Value::Null)
             }
             "submit_input" => {
                 self.reject_known_secrets(&payload).await?;
@@ -917,6 +959,25 @@ impl Runtime {
                     .map_err(|_| Error::Storage)?),
                     Ok(Err(provider_rig::RigAdapterError::Normalized(error))) => {
                         let (kind, message) = test_failure(&error);
+                        // The message above cannot carry the provider's own words,
+                        // so they are recorded here instead. A limit that clears
+                        // tomorrow and one that clears in a minute are the same
+                        // status code and completely different problems, and only
+                        // the provider's reply tells them apart.
+                        if let Some(text) = error.provider_text() {
+                            let _ = self.store.record_diagnostic(&DiagnosticEntry {
+                                sequence: 0,
+                                created_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or_default(),
+                                task_id: None,
+                                category: "provider_test".into(),
+                                subject: provider_id.to_owned(),
+                                outcome: "provider_fault".into(),
+                                detail: assistant_contracts::blocker::bounded_detail(text),
+                            });
+                        }
                         Ok(serde_json::to_value(
                             assistant_contracts::connection_test::ConnectionTestResult::failure(
                                 kind, &message,
@@ -1276,21 +1337,51 @@ fn test_failure(
             "That model is not available. Check the model ID, or pick a model the provider still serves."
                 .into(),
         ),
-        NormalizedError::RateLimited { .. } | NormalizedError::QuotaExceeded => (
+        // Deliberately does not echo the provider's body. A provider can reflect
+        // a credential or the prompt back inside its error, and this message goes
+        // to a Settings surface a user is likely to screenshot or share. The
+        // provider's own words are recorded in the developer diagnostics log
+        // instead, which is where untrusted text belongs.
+        NormalizedError::RateLimited { .. } => (
             NormalizedTestFailure::Quota,
-            "Quota or rate limit reached. Retry later.".into(),
+            "Rate limit reached. Retry later.".into(),
         ),
-        NormalizedError::Timeout | NormalizedError::NetworkUnavailable => (
+        NormalizedError::QuotaExceeded => (
+            NormalizedTestFailure::Quota,
+            "Account quota or credits exhausted. Check the provider account.".into(),
+        ),
+        NormalizedError::Timeout | NormalizedError::NetworkUnavailable { .. } => (
             NormalizedTestFailure::Network,
             "The network request failed. Check connectivity.".into(),
+        ),
+        // Reported as its own outcome rather than as a network fault. The request
+        // was delivered, so connectivity is already proven; telling the user to
+        // check their network here is what sent them looking in the wrong place.
+        NormalizedError::NoResponse => (
+            NormalizedTestFailure::ProviderError,
+            "The provider took the request but never replied. This is not a connection problem: the key is usually valid but has no entitlement for this model, or the account is out of credit.".into(),
         ),
         NormalizedError::InvalidResponse { .. } => (
             NormalizedTestFailure::ProviderError,
             "The provider connected but did not return a usable answer. It may not support streaming replies.".into(),
         ),
-        NormalizedError::ProviderError { .. } => (
+        NormalizedError::ProviderError { status, .. } => (
             NormalizedTestFailure::ProviderError,
-            "The provider returned an error.".into(),
+            match status {
+                // A request the provider would not parse is a request that will be
+                // refused identically next time, so this names the model and its
+                // settings rather than implying a fault worth retrying.
+                400 | 422 => format!(
+                    "The provider rejected this request (HTTP {status}). Check the model and its supported settings."
+                ),
+                402 => "The provider requires credits or account access (HTTP 402).".into(),
+                500..=599 => format!("The provider is unavailable (HTTP {status}). Retry later."),
+                // No status at all means the provider answered with something
+                // unrecognisable, which is worth distinguishing from a status we
+                // simply did not read.
+                0 => "The provider replied with an error Athera could not read. See the action log for its exact response.".into(),
+                _ => format!("The provider returned HTTP {status}."),
+            },
         ),
     }
 }

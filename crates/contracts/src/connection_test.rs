@@ -74,6 +74,14 @@ impl ConnectionTestService {
             || lower.contains("timed out")
             || lower.contains("tls")
             || lower.contains("ssl")
+            // A failed send is a network fault, not something the server said.
+            // The HTTP client wraps every failure to put a request on the wire -
+            // refused, reset, unresolvable, TLS - in this one phrase, and without
+            // it an unreachable host is reported as a fault nobody can name. It is
+            // matched here rather than left unclassified because the resulting
+            // client-library string is what otherwise reaches a person.
+            || lower.contains("error sending request")
+            || lower.contains("error connect")
         {
             NormalizedTestFailure::Network
         } else {

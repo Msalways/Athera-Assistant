@@ -386,7 +386,13 @@ fn connection_test_messages_do_not_echo_provider_bodies() {
         detail: "upstream echoed fixture-secret".into(),
     });
     assert!(!message.contains("fixture-secret"));
-    assert!(message.contains("provider returned an error"));
+    assert!(message.contains("HTTP 500"));
+    let (_, message) = test_failure(&NormalizedError::ProviderError {
+        status: 402,
+        detail: "upstream echoed fixture-secret".into(),
+    });
+    assert!(message.contains("credits or account access"));
+    assert!(!message.contains("fixture-secret"));
 }
 
 #[tokio::test]
@@ -582,7 +588,11 @@ async fn mcp_credentials_are_session_only_and_bound_before_network_io() {
         )
         .await
         .unwrap();
-    assert_eq!(status["state"], "connected");
+    assert_eq!(status["state"], "unavailable");
+    assert!(status["message"]
+        .as_str()
+        .unwrap()
+        .contains("session is not active"));
     assert_eq!(status["schema"], CONNECTION_STATE_SCHEMA_V1);
     for output in [
         runtime.snapshot().await.unwrap(),

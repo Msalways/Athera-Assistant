@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Cable,
   Check,
   Download,
   Info,
+  RefreshCw,
   Search,
   Settings2,
   Trash2,
@@ -13,6 +14,7 @@ import type {
   BuildInfo,
   Capability,
   ConnectionState,
+  DiagnosticEntry,
   FailoverMember,
   LocalShadowState,
   OAuthAuthorizationStart,
@@ -39,6 +41,34 @@ import { ProviderCatalogSettings } from "./ProviderCatalogSettings";
 import { FailoverSettings } from "./FailoverSettings";
 
 type Act = (name: string, payload: unknown) => Promise<boolean>;
+
+/**
+ * Why a connection address will be refused, or null when it is acceptable.
+ *
+ * The runtime only reports a normalized `Invalid input`, which on its own tells
+ * someone nothing about which part of the address to change. These are the two
+ * rules that actually bite: transport encryption, and the address naming the
+ * device rather than the machine the server runs on.
+ */
+export function mcpUrlProblem(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return "Enter the address of the MCP server.";
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return "That is not a valid address. It needs to look like https://host/path.";
+  }
+  if (parsed.protocol !== "https:") {
+    return `Connections use https, so "${parsed.protocol}//" is not accepted. Put the server behind https, or use a tunnel that terminates it.`;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") {
+    return `"${host}" is this device, not the computer the server runs on. Use the server's address on the network instead.`;
+  }
+  return null;
+}
+
 export function Configuration({
   snapshot,
   view,
@@ -59,6 +89,10 @@ export function Configuration({
     "none" | "bearer_token" | "api_key_header" | "oauth_authorization_code"
   >("none");
   const [mcpSecret, setMcpSecret] = useState("");
+  const [mcpHeader, setMcpHeader] = useState("x-api-key");
+  const [mcpTransport, setMcpTransport] = useState<
+    "streamable_http" | "legacy_sse"
+  >("streamable_http");
   const [authorizationServer, setAuthorizationServer] = useState("");
   const [oauthScopes, setOauthScopes] = useState("");
   const [oauthClientId, setOauthClientId] = useState("");
@@ -70,6 +104,7 @@ export function Configuration({
   const [callbackUrl, setCallbackUrl] = useState("");
   const [oauthError, setOauthError] = useState("");
   const [oauthNotice, setOauthNotice] = useState("");
+  const [mcpError, setMcpError] = useState("");
   const [busy, setBusy] = useState(false);
   const run = async (command: string, payload: unknown) => {
     setBusy(true);
@@ -112,6 +147,15 @@ export function Configuration({
     };
   }, [oauthStart]);
   async function addConnection() {
+    setMcpError("");
+    // Say why before dispatching, rather than letting the runtime's normalized
+    // rejection reach nobody. The runtime still decides; this only avoids
+    // spending a round trip on an address that cannot be accepted.
+    const problem = mcpUrlProblem(url);
+    if (problem) {
+      setMcpError(problem);
+      return;
+    }
     const id = crypto.randomUUID();
     const authentication =
       mcpAuth === "none"
@@ -124,7 +168,7 @@ export function Configuration({
           : mcpAuth === "api_key_header"
             ? {
                 kind: "api_key_header" as const,
-                header: "x-api-key",
+                header: mcpHeader.trim(),
                 secret_ref: `session:mcp:${id}`,
               }
             : {
@@ -139,14 +183,25 @@ export function Configuration({
       id,
       name,
       url,
-      transport: "streamable_http" as const,
+      transport: mcpTransport,
       authentication,
     };
     if (mcpAuth !== "oauth_authorization_code") {
-      await run(
-        mcpAuth === "none" ? "connect_mcp" : "connect_mcp_with_credential",
-        mcpAuth === "none" ? connection : { connection, secret: mcpSecret },
-      );
+      // These two paths had no handler at all, so a refused connection, a wrong
+      // address or a bad secret rejected into nothing: the form stayed as it was
+      // and the button looked broken. Report whatever came back.
+      try {
+        await run(
+          mcpAuth === "none" ? "connect_mcp" : "connect_mcp_with_credential",
+          mcpAuth === "none" ? connection : { connection, secret: mcpSecret },
+        );
+      } catch (error) {
+        setMcpError(
+          error instanceof Error
+            ? error.message
+            : "The connection could not be established.",
+        );
+      }
       return;
     }
     setBusy(true);
@@ -262,7 +317,16 @@ export function Configuration({
               title="Reconnect and refresh tools"
               aria-label={`Reconnect ${connection.name}`}
               disabled={busy}
-              onClick={() => void run("connect_mcp", connection)}
+              onClick={() => {
+                setMcpError("");
+                void run("connect_mcp", connection).catch((error: unknown) =>
+                  setMcpError(
+                    error instanceof Error
+                      ? error.message
+                      : "The connection could not be established.",
+                  ),
+                );
+              }}
             >
               <Download size={18} />
             </button>
@@ -271,7 +335,17 @@ export function Configuration({
               title="Disconnect"
               aria-label={`Disconnect ${connection.name}`}
               disabled={busy}
-              onClick={() => void run("disconnect_mcp", { id: connection.id })}
+              onClick={() => {
+                setMcpError("");
+                void run("disconnect_mcp", { id: connection.id }).catch(
+                  (error: unknown) =>
+                    setMcpError(
+                      error instanceof Error
+                        ? error.message
+                        : "The connection could not be closed.",
+                    ),
+                );
+              }}
             >
               <Unplug size={18} />
             </button>
@@ -310,12 +384,23 @@ export function Configuration({
             >
               <option value="none">None</option>
               <option value="bearer_token">Bearer token</option>
-              <option value="api_key_header">API key (x-api-key)</option>
+              <option value="api_key_header">API key header</option>
               <option value="oauth_authorization_code">
                 OAuth authorization code
               </option>
             </select>
           </label>
+          {mcpAuth === "api_key_header" && (
+            <label>
+              API key header
+              <input
+                required
+                value={mcpHeader}
+                onChange={(event) => setMcpHeader(event.target.value)}
+                maxLength={128}
+              />
+            </label>
+          )}
           {mcpAuth !== "none" && mcpAuth !== "oauth_authorization_code" && (
             <label>
               Credential
@@ -327,9 +412,25 @@ export function Configuration({
                 autoComplete="off"
                 maxLength={8192}
               />
-              <small>Held for this session and never saved in settings.</small>
+              <small>
+                Stored in Android's secure vault, never in settings.
+              </small>
             </label>
           )}
+          <label>
+            Transport
+            <select
+              value={mcpTransport}
+              onChange={(event) =>
+                setMcpTransport(
+                  event.target.value as "streamable_http" | "legacy_sse",
+                )
+              }
+            >
+              <option value="streamable_http">Streamable HTTP</option>
+              <option value="legacy_sse">Legacy SSE</option>
+            </select>
+          </label>
           <label>
             Server URL
             <input
@@ -399,6 +500,11 @@ export function Configuration({
                 </small>
               </details>
             </>
+          )}
+          {mcpError && (
+            <p role="alert" className="inline-error">
+              {mcpError}
+            </p>
           )}
           {oauthError && (
             <p role="alert" className="inline-error">
@@ -534,7 +640,7 @@ export function Configuration({
             rules={snapshot.adaptive_rules ?? []}
           />
         ) : tab === "diagnostics" ? (
-          <DiagnosticsTab snapshot={snapshot} />
+          <DiagnosticsTab snapshot={snapshot} act={act} />
         ) : (
           <>
             <div className="search-row">
@@ -1190,7 +1296,7 @@ function MemorySettings() {
   );
 }
 
-function DiagnosticsTab({ snapshot }: { snapshot: Snapshot }) {
+function DiagnosticsTab({ snapshot, act }: { snapshot: Snapshot; act: Act }) {
   const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
   useEffect(() => {
     void getBuildInfo().then(setBuildInfo);
@@ -1232,8 +1338,77 @@ function DiagnosticsTab({ snapshot }: { snapshot: Snapshot }) {
         model to measure what the local model would have done, and it never
         answers.
       </p>
+      <DiagnosticLog act={act} />
       <LocalShadowPanel state={snapshot.local_shadow} />
     </section>
+  );
+}
+
+/**
+ * What the runtime actually attempted, and the exact error each attempt returned.
+ *
+ * Separate from the conversation because this is the part that never reaches it:
+ * the retries that were abandoned, and the provider's own wording for a failure.
+ * An entry that stops at `started` with no matching outcome is a request that went
+ * out and never came back, which is what the user-facing message cannot say.
+ */
+function DiagnosticLog({ act }: { act: Act }) {
+  const [entries, setEntries] = useState<DiagnosticEntry[] | null>(null);
+  const [error, setError] = useState("");
+  const load = useCallback(() => {
+    setError("");
+    void command<DiagnosticEntry[]>("diagnostics", { limit: 200 })
+      .then(setEntries)
+      .catch((e: unknown) =>
+        setError(e instanceof Error ? e.message : "Could not read the log"),
+      );
+  }, []);
+  useEffect(load, [load]);
+  return (
+    <details className="connection-preset">
+      <summary>Action log ({entries?.length ?? "..."})</summary>
+      <p className="field-help">
+        Most recent first. Entries ending at <code>started</code> never reported
+        an outcome: the request left and nothing came back.
+      </p>
+      {error && (
+        <p role="alert" className="inline-error">
+          {error}
+        </p>
+      )}
+      {entries && entries.length === 0 && (
+        <p className="field-help">Nothing recorded yet.</p>
+      )}
+      {entries?.map((entry) => (
+        <div key={entry.sequence} className="small">
+          <strong>{entry.category}</strong> · {entry.subject} · {entry.outcome}
+          {entry.detail && (
+            <>
+              <br />
+              <small>{entry.detail}</small>
+            </>
+          )}
+        </div>
+      ))}
+      <button className="icon-button" onClick={load} aria-label="Reload log">
+        <RefreshCw size={16} />
+      </button>
+      <button
+        className="icon-button"
+        aria-label="Clear log"
+        onClick={() => {
+          void act("clear_diagnostics", {})
+            .then(load)
+            .catch((e: unknown) =>
+              setError(
+                e instanceof Error ? e.message : "Could not clear the log",
+              ),
+            );
+        }}
+      >
+        <Trash2 size={16} />
+      </button>
+    </details>
   );
 }
 

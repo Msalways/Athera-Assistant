@@ -1,10 +1,12 @@
 //! MCP uses the upstream Rust SDK; tools are disabled until explicitly enabled.
 mod auth;
+mod legacy_sse;
 mod oauth;
 
 use assistant_contracts::*;
 use async_trait::async_trait;
 pub use auth::{CredentialPurpose, CredentialRequest, CredentialResolver, McpAuthentication};
+use legacy_sse::OriginPinnedSseClient;
 pub use oauth::{
     authorization_server_metadata_urls, protected_resource_metadata_urls, AuthorizationCallback,
     AuthorizationServerMetadata, AuthorizationTransaction, ClientRegistration, OAuthChallenge,
@@ -14,10 +16,11 @@ use rmcp::{
     model::CallToolRequestParam,
     service::{ClientInitializeError, RunningService, ServiceError},
     transport::{
+        sse_client::{SseClientConfig, SseTransportError},
         streamable_http_client::{
             AuthRequiredError, StreamableHttpClientTransportConfig, StreamableHttpError,
         },
-        DynamicTransportError, StreamableHttpClientTransport,
+        DynamicTransportError, SseClientTransport, StreamableHttpClientTransport,
     },
     RoleClient, ServiceExt,
 };
@@ -34,6 +37,7 @@ pub const PARALLEL_SEARCH_URL: &str = "https://search.parallel.ai/mcp";
 pub enum McpTransport {
     #[default]
     StreamableHttp,
+    LegacySse,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +104,20 @@ impl ConnectionConfig {
         self.authentication.validate(&url)
     }
 
+    /// Whether this connection points at the device it runs on.
+    ///
+    /// That is a legitimate choice for a server bundled with the app, but it is
+    /// also the exact URL someone reaches for when pointing at a development
+    /// machine. On an emulator those are different machines and the connection is
+    /// refused before a request is ever made, which reads as a broken app rather
+    /// than a wrong address. Surfaced so the user can be told which it is.
+    pub fn targets_this_device(&self) -> bool {
+        reqwest::Url::parse(&self.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
+    }
+
     pub fn credential_request(&self) -> Result<Option<CredentialRequest>> {
         self.validate()?;
         let endpoint = reqwest::Url::parse(&self.url).map_err(|_| Error::InvalidInput)?;
@@ -144,6 +162,18 @@ impl McpManager {
 
     pub async fn connect(&self, config: &ConnectionConfig) -> Result<Vec<ToolSpec>> {
         config.validate()?;
+        // Tear down any existing session before attempting the new one.
+        //
+        // Updating a live connection used to leave the old session in place: the
+        // new config was stored, the connect failed, and the previous client kept
+        // serving its old tools. Nothing reported a problem, and a liveness check
+        // against the session map would read that stale session as healthy, so the
+        // update appeared to have done nothing. Dropping it first means a failed
+        // update leaves the connection honestly inactive rather than quietly
+        // serving the configuration the user just replaced.
+        if self.clients.read().await.contains_key(&config.id) {
+            self.disconnect(&config.id).await;
+        }
         self.configs
             .write()
             .await
@@ -161,14 +191,44 @@ impl McpManager {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| Error::Unavailable)?;
-        let transport_config = match auth.bearer {
-            Some(token) => {
-                StreamableHttpClientTransportConfig::with_uri(config.url.clone()).auth_header(token)
+        let connected = match config.transport {
+            McpTransport::StreamableHttp => {
+                let transport_config = match auth.bearer {
+                    Some(token) => {
+                        StreamableHttpClientTransportConfig::with_uri(config.url.clone())
+                            .auth_header(token)
+                    }
+                    None => StreamableHttpClientTransportConfig::with_uri(config.url.clone()),
+                };
+                ().serve(StreamableHttpClientTransport::with_client(
+                    client,
+                    transport_config,
+                ))
+                .await
             }
-            None => StreamableHttpClientTransportConfig::with_uri(config.url.clone()),
+            McpTransport::LegacySse => {
+                let transport = SseClientTransport::start_with_client(
+                    OriginPinnedSseClient::new(client, endpoint.clone(), auth.bearer),
+                    SseClientConfig {
+                        sse_endpoint: config.url.clone().into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| match error {
+                    SseTransportError::Client(error)
+                        if error
+                            .status()
+                            .is_some_and(|status| matches!(status.as_u16(), 401 | 403)) =>
+                    {
+                        Error::AuthRequired
+                    }
+                    _ => Error::Unavailable,
+                })?;
+                ().serve(transport).await
+            }
         };
-        let transport = StreamableHttpClientTransport::with_client(client, transport_config);
-        let client = match ().serve(transport).await {
+        let client = match connected {
             Ok(client) => client,
             Err(error) => {
                 self.record_auth_challenge(&config.id, initialize_oauth_challenge(&error))
@@ -271,6 +331,11 @@ impl McpManager {
         self.clients.write().await.remove(id);
         self.configs.write().await.remove(id);
         self.auth_challenges.write().await.remove(id);
+    }
+
+    /// Reports whether an MCP session completed initialization and tool discovery.
+    pub async fn is_connected(&self, id: &str) -> bool {
+        self.clients.read().await.contains_key(id)
     }
 }
 #[async_trait]
@@ -405,7 +470,9 @@ fn streamable_oauth_challenge(
 }
 
 fn transport_requires_auth(error: &DynamicTransportError) -> bool {
-    error
+    error.error.downcast_ref::<SseTransportError<reqwest::Error>>().is_some_and(|error| {
+        matches!(error, SseTransportError::Client(error) if error.status().is_some_and(|status| matches!(status.as_u16(), 401 | 403)))
+    }) || error
         .error
         .downcast_ref::<StreamableHttpError<reqwest::Error>>()
         .is_some_and(|error| match error {
@@ -665,6 +732,23 @@ mod tests {
             .unwrap();
         assert_eq!(auth.bearer, None);
         assert_eq!(auth.headers["x-api-key"], "fixture-key");
+        let composio = McpAuthentication::ApiKeyHeader {
+            header: "x-consumer-api-key".into(),
+            secret_ref: "vault:mcp:composio".into(),
+        };
+        let auth = composio
+            .resolve("composio", &endpoint, &FixedCredentials("fixture-key"))
+            .unwrap();
+        assert_eq!(auth.headers["x-consumer-api-key"], "fixture-key");
+        assert!(!format!("{auth:?}").contains("fixture-key"));
+        let other = McpAuthentication::ApiKeyHeader {
+            header: "ocp-apim-subscription-key".into(),
+            secret_ref: "vault:mcp:other".into(),
+        };
+        let auth = other
+            .resolve("other", &endpoint, &FixedCredentials("fixture-key"))
+            .unwrap();
+        assert_eq!(auth.headers["ocp-apim-subscription-key"], "fixture-key");
     }
 
     #[test]
@@ -682,6 +766,25 @@ mod tests {
             preset: None,
         };
         assert_eq!(base.validate(), Err(Error::InvalidInput));
+        let invalid_transport_header = ConnectionConfig {
+            authentication: McpAuthentication::ApiKeyHeader {
+                header: "content-type".into(),
+                secret_ref: "vault:key".into(),
+            },
+            ..base.clone()
+        };
+        assert_eq!(
+            invalid_transport_header.validate(),
+            Err(Error::InvalidInput)
+        );
+        let protocol_header = ConnectionConfig {
+            authentication: McpAuthentication::ApiKeyHeader {
+                header: "Mcp-Session-Id".into(),
+                secret_ref: "vault:key".into(),
+            },
+            ..base.clone()
+        };
+        assert_eq!(protocol_header.validate(), Err(Error::InvalidInput));
         let oauth = ConnectionConfig {
             authentication: McpAuthentication::OauthAuthorizationCode {
                 token_ref: "keystore:oauth".into(),
@@ -763,6 +866,50 @@ mod tests {
         assert!(transport_requires_auth(&transport));
         assert!(!format!("{transport:?}").contains("secret-token-body"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_update_leaves_the_connection_inactive_rather_than_serving_the_old_session() {
+        // The behaviour that made an update look like it had done nothing: the new
+        // config was stored, the connect failed, and the previous session kept
+        // serving its old tools, so a liveness check read healthy and the UI
+        // reported the connection as active.
+        let manager = McpManager::new(Arc::new(FixedCredentials("fixture")));
+        let config = ConnectionConfig {
+            schema: MCP_CONNECTION_SCHEMA_V1.into(),
+            id: "unreachable".into(),
+            name: "Unreachable".into(),
+            url: "https://127.0.0.1:1/mcp".into(),
+            transport: McpTransport::StreamableHttp,
+            authentication: McpAuthentication::None,
+            preset: None,
+        };
+        let outcome = manager.connect(&config).await;
+        assert!(outcome.is_err(), "nothing is listening on that port");
+
+        assert!(
+            !manager.is_connected(&config.id).await,
+            "a failed connect must not leave the connection reporting active"
+        );
+    }
+
+    #[test]
+    fn a_loopback_mcp_url_is_recognised_as_targeting_this_device() {
+        // On an emulator this address is the device, not the development machine,
+        // and the connection is refused outright. Worth naming so the failure is
+        // not read as a broken app.
+        let with_host = |url: &str| ConnectionConfig {
+            schema: MCP_CONNECTION_SCHEMA_V1.into(),
+            id: "c".into(),
+            name: "c".into(),
+            url: url.into(),
+            transport: McpTransport::StreamableHttp,
+            authentication: McpAuthentication::None,
+            preset: None,
+        };
+        assert!(with_host("https://localhost:9000/mcp").targets_this_device());
+        assert!(with_host("https://127.0.0.1:9000/mcp").targets_this_device());
+        assert!(!with_host("https://mcp.example.com/mcp").targets_this_device());
     }
 
     #[test]

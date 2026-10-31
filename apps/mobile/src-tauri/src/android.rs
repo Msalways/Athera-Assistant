@@ -1,13 +1,25 @@
 //! Thin Android assembly. Kotlin owns accessibility; Rust owns model and policy state.
+use adapter_mcp::{ConnectionConfig, McpAuthentication};
 use app_runtime::{OAuthTokenVault, Runtime};
 use assistant_contracts::*;
 use assistant_core::sms::Experiment;
+use jni::{errors::ThrowRuntimeExAndDefault, objects::JObject, EnvUnowned};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{
     plugin::{Builder, PluginHandle},
     Manager, State, Wry,
 };
+
+#[no_mangle]
+pub extern "system" fn Java_dev_local_assistant_MainActivity_initRustlsVerifier<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _activity: JObject<'caller>,
+    context: JObject<'caller>,
+) {
+    env.with_env(|env| rustls_platform_verifier::android::init_with_env(env, context))
+        .resolve::<ThrowRuntimeExAndDefault>();
+}
 
 struct AndroidTools {
     handle: PluginHandle<Wry>,
@@ -48,10 +60,8 @@ impl OAuthTokenVault for AndroidAuth {
     }
 
     fn load(&self, handle: &str, binding: &str) -> Result<Option<String>> {
-        let response = self.call_native(
-            "load_secret",
-            json!({"handle":handle,"binding":binding}),
-        )?;
+        let response =
+            self.call_native("load_secret", json!({"handle":handle,"binding":binding}))?;
         match response.get("value") {
             Some(Value::String(value)) => Ok(Some(value.clone())),
             Some(Value::Null) => Ok(None),
@@ -139,6 +149,18 @@ fn provider_vault_binding(provider_id: &str, auth_option_id: &str) -> Result<Str
     Ok(format!("{provider_id}|{auth_option_id}"))
 }
 
+fn mcp_vault_handle(config: &ConnectionConfig) -> Result<String> {
+    config.validate()?;
+    Ok(format!("mcp-key:{}", config.id))
+}
+
+fn mcp_vault_binding(config: &ConnectionConfig) -> Result<String> {
+    config.validate()?;
+    let transport = serde_json::to_string(&config.transport).map_err(|_| Error::InvalidInput)?;
+    let auth = serde_json::to_string(&config.authentication).map_err(|_| Error::InvalidInput)?;
+    Ok(format!("{}|{transport}|{auth}", config.url))
+}
+
 #[tauri::command]
 async fn command(
     state: State<'_, AndroidRuntime>,
@@ -161,8 +183,8 @@ async fn dispatch(state: &AndroidRuntime, name: &str, payload: Value) -> Result<
             let result = state.runtime.dispatch(name, payload.clone()).await?;
             if let Some(key) = payload["api_key"].as_str() {
                 state.auth.store(
-                    &cloud_vault_handle_from(&payload["cloud"] )?,
-                    &cloud_vault_binding(&payload["cloud"] )?,
+                    &cloud_vault_handle_from(&payload["cloud"])?,
+                    &cloud_vault_binding(&payload["cloud"])?,
                     key,
                 )?;
             }
@@ -172,9 +194,7 @@ async fn dispatch(state: &AndroidRuntime, name: &str, payload: Value) -> Result<
             let snapshot = state.runtime.snapshot().await?;
             if let Some(cloud) = snapshot["settings"]["cloud"].as_object() {
                 let cloud = Value::Object(cloud.clone());
-                state.auth.delete(
-                    &cloud_vault_handle_from(&cloud)?,
-                )?;
+                state.auth.delete(&cloud_vault_handle_from(&cloud)?)?;
             }
             state.runtime.dispatch(name, payload).await
         }
@@ -198,6 +218,47 @@ async fn dispatch(state: &AndroidRuntime, name: &str, payload: Value) -> Result<
                 state.auth.delete(&provider_vault_handle(provider_id)?)?;
             }
             state.runtime.dispatch(name, payload).await
+        }
+        "connect_mcp_with_credential" => {
+            let config: ConnectionConfig = serde_json::from_value(payload["connection"].clone())
+                .map_err(|_| Error::InvalidInput)?;
+            let secret = payload["secret"].as_str().ok_or(Error::InvalidInput)?;
+            state.runtime.restore_mcp_key(&config, secret.to_owned())?;
+            state.auth.store(
+                &mcp_vault_handle(&config)?,
+                &mcp_vault_binding(&config)?,
+                secret,
+            )?;
+            state
+                .runtime
+                .dispatch(
+                    "connect_mcp",
+                    serde_json::to_value(config).map_err(|_| Error::InvalidInput)?,
+                )
+                .await
+        }
+        "save_mcp_credential" | "clear_mcp_credential" => {
+            let id = string("connection_id")?;
+            let config = state
+                .runtime
+                .store
+                .setting("settings")?
+                .and_then(|value| serde_json::from_value::<app_runtime::Settings>(value).ok())
+                .and_then(|settings| settings.connections.into_iter().find(|item| item.id == id))
+                .ok_or(Error::InvalidInput)?;
+            if name == "save_mcp_credential" {
+                let secret = payload["secret"].as_str().ok_or(Error::InvalidInput)?;
+                state.runtime.restore_mcp_key(&config, secret.to_owned())?;
+                state.auth.store(
+                    &mcp_vault_handle(&config)?,
+                    &mcp_vault_binding(&config)?,
+                    secret,
+                )?;
+                Ok(Value::Null)
+            } else {
+                state.auth.delete(&mcp_vault_handle(&config)?)?;
+                state.runtime.dispatch(name, payload).await
+            }
         }
         "authorize_connection" => {
             let redirect_uri = string("redirect_uri")?;
@@ -338,6 +399,30 @@ pub fn run() {
                             ))?;
                         }
                     }
+                    let saved_connections = runtime
+                        .store
+                        .setting("settings")?
+                        .and_then(|value| serde_json::from_value::<app_runtime::Settings>(value).ok())
+                        .map(|settings| settings.connections)
+                        .unwrap_or_default();
+                    let mut reconnect = Vec::new();
+                    for config in saved_connections {
+                        if config.validate().is_err() {
+                            continue;
+                        }
+                        let ready = match &config.authentication {
+                            McpAuthentication::None | McpAuthentication::OauthAuthorizationCode { .. } => true,
+                            McpAuthentication::BearerToken { .. } | McpAuthentication::ApiKeyHeader { .. } => {
+                                match auth.load(&mcp_vault_handle(&config)?, &mcp_vault_binding(&config)?) {
+                                    Ok(Some(key)) => runtime.restore_mcp_key(&config, key).is_ok(),
+                                    _ => false,
+                                }
+                            }
+                        };
+                        if ready {
+                            reconnect.push(config);
+                        }
+                    }
                     let store = Arc::new(storage_sqlite::SqliteStore::open(
                         directory.join("sms-experiment.db"),
                     )?);
@@ -368,6 +453,16 @@ pub fn run() {
                         experiment,
                         tools,
                         auth,
+                    });
+                    // The mobile setup callback already hands over an
+                    // `&AppHandle`, so the reconnect work needs a clone of that
+                    // reference rather than another call to reach the handle.
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        for config in reconnect {
+                            let state = handle.state::<AndroidRuntime>();
+                            let _ = state.runtime.connect(config).await;
+                        }
                     });
                     Ok(())
                 })

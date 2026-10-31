@@ -13,14 +13,21 @@ is a compatibility mode rather than a third current standard. Custom transports 
 allowed only through an explicit adapter that preserves MCP JSON-RPC and lifecycle
 rules.
 
-The Rust adapter implements Streamable HTTP discovery and calls for anonymous,
-static Bearer, and reviewed API-key-header profiles. It resolves credentials through
-an endpoint-bound interface before opening the transport, disables redirects, maps
+The Rust adapter implements Streamable HTTP and explicitly selected legacy SSE for
+tool discovery and invocation. It supports anonymous, static Bearer, and
+user-configured single API-key-header profiles. Header names are
+validated as HTTP tokens and transport-owned headers are reserved; the credential
+value stays in session memory on development hosts and in the Android secure vault
+on the phone. This supports servers such as Composio without a
+vendor-specific header list. It resolves credentials through an endpoint-bound
+interface before opening the transport, disables redirects, maps
 MCP 401 challenges to an authentication pause, and keeps credential values out of
 the manifest. OAuth manifests can be validated and bound to an existing opaque token
 reference; browser authorization, refresh and Android Keystore storage are
-implemented behind their native boundary. Stdio, legacy SSE fallback, resources,
-prompts and elicitation remain unavailable until their verification gates pass.
+implemented behind their native boundary. The legacy SSE client's server-announced
+message URL is restricted to the configured HTTPS origin. Stdio, automatic SSE
+fallback, resources, prompts and elicitation remain unavailable until their
+verification gates pass.
 
 ## Runtime placement
 
@@ -28,7 +35,7 @@ prompts and elicitation remain unavailable until their verification gates pass.
 | --- | --- | --- | --- |
 | Streamable HTTP | Yes | Yes | Primary remote transport; HTTPS only |
 | `stdio` subprocess | No | Yes | The host launches an explicitly approved command |
-| Legacy HTTP+SSE | Compatibility only | Compatibility only | Try only when the selected connection enables fallback |
+| Legacy HTTP+SSE | Yes, explicit selection | Yes, explicit selection | Server-announced message URL stays on the configured HTTPS origin |
 | Custom | No generic mode | Adapter-specific | Install and review a transport adapter |
 
 Android cannot usefully launch the Node, Python or native subprocesses expected by
@@ -81,7 +88,7 @@ transport fields fail closed.
 | `oauth_client_credentials` | Background server worker | Client ID, token audience/resource and scopes | Client secret or private-key ref |
 | `enterprise_managed` | Organization-controlled access | Issuer and negotiated extension metadata | Token refs managed by enterprise policy |
 | `bearer_token` | Provider API key or static token in `Authorization` | Header scheme plus secret ref | Token value |
-| `api_key_header` | Provider-specific header such as `x-api-key` | Reviewed header name plus secret ref | Key value |
+| `api_key_header` | User-supplied credential header such as `x-api-key` | Validated header name plus secret ref | Key value |
 | `basic` | Legacy server explicitly requiring HTTP Basic | Username ref and password ref | Both values |
 | `mutual_tls` | Enterprise/private MCP | Certificate and key refs | Private key and certificate chain |
 | `signed_request` | Vendor-specific HMAC/JWT/SigV4-style auth | Named auth-adapter ID and non-secret options | Signing-key refs |

@@ -10,6 +10,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "getrandom 0.4.3",
+ "http",
  "jsonschema",
  "reqwest 0.12.28",
  "rmcp",
@@ -133,11 +134,14 @@ dependencies = [
 name = "assistant-mobile-shell"
 version = "0.1.0"
 dependencies = [
+ "adapter-mcp",
  "app-runtime",
  "assistant-contracts",
  "assistant-core",
  "async-trait",
+ "jni 0.22.4",
  "provider-needle",
+ "rustls-platform-verifier",
  "serde_json",
  "storage-sqlite",
  "tauri",

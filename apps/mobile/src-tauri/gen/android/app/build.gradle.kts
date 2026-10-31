@@ -1,4 +1,5 @@
 import java.util.Properties
+import groovy.json.JsonSlurper
 
 plugins {
     id("com.android.application")
@@ -14,6 +15,14 @@ val tauriProperties = Properties().apply {
 }
 val oauthRedirectHost = providers.gradleProperty("oauthRedirectHost").orElse("oauth.invalid").get()
 val oauthRedirectPath = providers.gradleProperty("oauthRedirectPath").orElse("/oauth/callback").get()
+val rustlsAndroidPackage = ((JsonSlurper().parseText(providers.exec {
+    workingDir = rootProject.projectDir
+    commandLine("cargo", "metadata", "--format-version", "1", "--filter-platform", "aarch64-linux-android")
+}.standardOutput.asText.get()) as Map<*, *>)["packages"] as List<Map<String, Any>>)
+    .first { it["name"] == "rustls-platform-verifier-android" }
+repositories {
+    maven { url = uri(file(rustlsAndroidPackage["manifest_path"] as String).parentFile.resolve("maven")) }
+}
 check(oauthRedirectHost.matches(Regex("[A-Za-z0-9.-]+"))) { "oauthRedirectHost must be a DNS host" }
 check(oauthRedirectPath.startsWith("/") && !oauthRedirectPath.contains("#")) {
     "oauthRedirectPath must be an absolute path without a fragment"
@@ -95,6 +104,7 @@ rust {
 }
 
 dependencies {
+    implementation("rustls:rustls-platform-verifier:${rustlsAndroidPackage["version"]}")
     implementation("androidx.browser:browser:1.8.0")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")

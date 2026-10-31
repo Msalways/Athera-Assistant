@@ -226,7 +226,13 @@ pub(crate) async fn run(
                         (WorkerOutcome::Completed { result_refs: vec![result_id] }, "Worker completed.".into())
                     }
                     Err(error) => {
-                        let retryable = matches!(error, Error::Timeout | Error::Unavailable | Error::RateLimited);
+                        // Only faults that a second identical attempt could plausibly
+                        // clear are retried. A limit, an exhausted balance, or a
+                        // request the provider refused to parse will be refused the
+                        // same way three times, and retrying them burns the very
+                        // quota that is already exhausted while delaying the message
+                        // that says what to do.
+                        let retryable = matches!(error, Error::Timeout | Error::Unavailable);
                         let message = error.to_string();
                         (WorkerOutcome::Failed { message: message.clone(), retryable }, message)
                     }

@@ -234,7 +234,27 @@ fn validate_secret(value: &str) -> Result<()> {
 fn validate_api_key_header(header: &str) -> Result<()> {
     let name = HeaderName::from_bytes(header.as_bytes()).map_err(|_| Error::InvalidInput)?;
     let lower = name.as_str();
-    if !matches!(lower, "x-api-key" | "api-key") {
+    // MCP transport and authorization own these headers. Credentials can use
+    // any other valid HTTP header name supplied by the user.
+    if header.len() > 128
+        || lower.starts_with("mcp-")
+        || matches!(
+            lower,
+            "host"
+                | "content-length"
+                | "content-type"
+                | "accept"
+                | "authorization"
+                | "proxy-authorization"
+                | "cookie"
+                | "connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "last-event-id"
+        )
+    {
         return Err(Error::InvalidInput);
     }
     Ok(())

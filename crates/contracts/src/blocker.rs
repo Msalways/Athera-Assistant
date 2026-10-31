@@ -2,8 +2,54 @@
 //! Each blocker describes exactly why a task is paused and how to recover.
 use serde::{Deserialize, Serialize};
 
+use crate::Id;
+
 /// Schema version for task blockers.
 pub const TASK_BLOCKER_SCHEMA_V1: &str = "aethra.task-blocker.v1";
+
+/// One entry in the developer diagnostics log.
+///
+/// A developer-facing record of what the runtime attempted and what came back,
+/// including the parts that never reach the user: retries that were abandoned, and
+/// the provider's own wording for a failure. Kept apart from the task event
+/// stream, which is the user-facing story of a turn, because this records the
+/// parts that never surface there.
+///
+/// `detail` is bounded and must never carry a credential, header or token.
+/// Redaction happens before an entry is built, so an adapter that forgets passes
+/// nothing rather than everything.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DiagnosticEntry {
+    pub sequence: u64,
+    pub created_at: i64,
+    pub task_id: Option<Id>,
+    /// What kind of internal action this was, e.g. `provider_request`.
+    pub category: String,
+    /// What it acted on: a provider id, a connection id, a tool name.
+    pub subject: String,
+    /// How it ended: `started`, `ok`, `failed`, `retrying`, `skipped`.
+    pub outcome: String,
+    /// The exact error text as the layer below reported it.
+    pub detail: String,
+}
+
+/// Longest a diagnostic detail may be, so a verbose provider payload cannot fill
+/// the device. Truncated rather than rejected: the opening of an error is the
+/// part that identifies it.
+pub const DIAGNOSTIC_DETAIL_LIMIT: usize = 2_000;
+
+/// Trims a detail to [`DIAGNOSTIC_DETAIL_LIMIT`], noting that it was cut.
+pub fn bounded_detail(detail: &str) -> String {
+    if detail.len() <= DIAGNOSTIC_DETAIL_LIMIT {
+        return detail.to_owned();
+    }
+    let mut end = DIAGNOSTIC_DETAIL_LIMIT;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &detail[..end])
+}
 
 /// A typed reason why task progress is paused.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,6 +96,16 @@ pub enum TaskBlocker {
     HeldOnDevice {
         detail: String,
     },
+    /// The provider accepted a request and never replied.
+    ///
+    /// Recorded as its own blocker because it is not a network fault and not a
+    /// rejected key: the request arrived, which is what rules those out and leaves
+    /// access for that specific model as the thing to check. Also tells the UI not
+    /// to suggest a fallback, because another key would fail the same way.
+    ProviderNotAnswering {
+        provider_id: String,
+        model: String,
+    },
 }
 
 impl TaskBlocker {
@@ -73,6 +129,13 @@ impl TaskBlocker {
             }
             Self::HeldOnDevice { .. } => {
                 "This was kept on your device and could not be answered here."
+            }
+            Self::ProviderNotAnswering { model, .. } => {
+                if model.is_empty() {
+                    "Check the key's access for the model in Settings."
+                } else {
+                    "Check the key's access for this model in Settings."
+                }
             }
         }
     }
@@ -124,6 +187,11 @@ impl TaskBlocker {
             Self::HeldOnDevice { detail } => {
                 if detail.is_empty() {
                     return Err("detail is required");
+                }
+            }
+            Self::ProviderNotAnswering { provider_id, .. } => {
+                if provider_id.is_empty() {
+                    return Err("provider_id is required");
                 }
             }
         }

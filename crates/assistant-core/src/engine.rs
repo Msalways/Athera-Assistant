@@ -296,6 +296,23 @@ impl Assistant {
                 &self.cloud
             };
             let worker_id = Id::new_v4();
+            // The attempt itself, before the call, so a log that ends here shows a
+            // request that went out and never came back. That is the distinction
+            // this log exists to preserve.
+            self.record(
+                Some(task.id),
+                "provider_request",
+                provider.id(),
+                "started",
+                &format!(
+                    "model={} role={:?} step={} attempt={} tools={}",
+                    provider.model(),
+                    task.role,
+                    task.step,
+                    task.failures + 1,
+                    exposed.len()
+                ),
+            );
             self.store.append_event(&NewRunEvent {
                 run_id: task.id,
                 worker_id: Some(worker_id),
@@ -380,6 +397,13 @@ impl Assistant {
             })?;
             match outcome {
                 Ok(action) => {
+                    self.record(
+                        Some(task.id),
+                        "provider_request",
+                        provider.id(),
+                        "ok",
+                        "provider returned an action",
+                    );
                     // Attribute the turn to the provider that actually answered.
                     if let Ok(slot) = answered_by.lock() {
                         if let Some(provider_id) = slot.as_ref() {
@@ -410,15 +434,98 @@ impl Assistant {
                     self.store.save_task(&task)?;
                     return Ok(task);
                 }
+                // The provider answered and explained itself. Its explanation is
+                // the diagnosis — only it knows whether this is a daily ceiling,
+                // an exhausted balance, or a request it would not parse — so it is
+                // shown as given rather than replaced with a sentence that is
+                // certain to be vaguer and often wrong about what to do next.
+                Err(Error::ProviderFault { status, summary }) if task.role != Role::Fast => {
+                    task.failures += 1;
+                    task.status = TaskStatus::Failed;
+                    self.record(
+                        Some(task.id),
+                        "provider_request",
+                        self.cloud.id(),
+                        "provider_fault",
+                        &summary,
+                    );
+                    // The status is prefixed because it is the one fact Athera
+                    // holds that the provider did not state, and a provider that
+                    // gave no status at all is a different situation from one that
+                    // refused with a specific code.
+                    task.message = if status > 0 {
+                        format!("{} returned HTTP {status}: {summary}", self.cloud.id())
+                    } else {
+                        format!("{} reported: {summary}", self.cloud.id())
+                    };
+                    self.store.save_task(&task)?;
+                    return Ok(task);
+                }
+                // Never reached, rather than reached and refused. The underlying
+                // reason goes to the action log in full, because "unreachable"
+                // on its own cannot be told apart from a certificate that will not
+                // validate or a proxy that intercepts - and the person debugging
+                // this needs the difference, while the person using the app needs
+                // the one thing they can act on.
+                Err(Error::Unreachable { detail }) if task.role != Role::Fast => {
+                    task.failures += 1;
+                    task.status = TaskStatus::Failed;
+                    self.record(
+                        Some(task.id),
+                        "provider_request",
+                        self.cloud.id(),
+                        "unreachable",
+                        &detail,
+                    );
+                    task.message = format!(
+                        "{} could not be reached, so this could not be answered. Check the connection, then try again.",
+                        self.cloud.id()
+                    );
+                    self.store.save_task(&task)?;
+                    return Ok(task);
+                }
                 Err(error) => self.failure(&mut task, error)?,
             }
         }
     }
+    /// Records one internal action and the exact error behind it.
+    ///
+    /// Never returns an error: losing a log line must not be able to fail the
+    /// action being logged, which would turn a diagnostic aid into a new fault.
+    fn record(
+        &self,
+        task_id: Option<Id>,
+        category: &str,
+        subject: &str,
+        outcome: &str,
+        detail: &str,
+    ) {
+        let _ = self.store.record_diagnostic(&DiagnosticEntry {
+            sequence: 0,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default(),
+            task_id,
+            category: category.to_owned(),
+            subject: subject.to_owned(),
+            outcome: outcome.to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+
     /// A tool that could not run is not a cloud-model problem. Reporting it as
     /// one sends the user to the provider screen when the real fix is the
     /// connection this tool needs, so name the tool and the cause.
     fn tool_failure(&self, task: &mut Task, tool: &ToolSpec, error: Error) -> Result<()> {
         task.failures += 1;
+        self.record(
+            Some(task.id),
+            "tool_call",
+            &tool.name,
+            "failed",
+            &format!("error={error} connection={}", tool.connection_id),
+        );
         task.status = TaskStatus::Failed;
         task.message = match error {
             Error::Unavailable | Error::AuthRequired => {
@@ -443,6 +550,51 @@ impl Assistant {
     fn failure(&self, task: &mut Task, error: Error) -> Result<()> {
         task.failures += 1;
         task.message = error.to_string();
+        // Recorded before any narrowing below, so the log keeps the raw error even
+        // where the user-facing message deliberately replaces it. The replaced
+        // wording is the diagnosis; this is the evidence.
+        self.record(
+            Some(task.id),
+            "provider_request",
+            self.cloud.id(),
+            "failed",
+            &format!(
+                "failures={} error={error} role={:?} step={}",
+                task.failures, task.role, task.step
+            ),
+        );
+        if error == Error::ProviderSilent {
+            // Not a transient fault, so not worth repeating. A provider that
+            // accepted the request and then stopped answering will do the same
+            // three times over, so retrying only turns one clear fault into ninety
+            // seconds of a spinner. Say what happened instead: the request was
+            // delivered, which is exactly what rules out the network and points at
+            // the key.
+            task.status = TaskStatus::Failed;
+            task.message = format!(
+                "{} took the request but never replied. This is a provider-side fault, not a connection problem: the key is usually valid but has no inference entitlement for this model, or the account is out of credit. Check the key's access for {} in Settings.",
+                self.cloud.id(),
+                self.cloud.model()
+            );
+            self.record(
+                Some(task.id),
+                "provider_request",
+                self.cloud.model(),
+                "no_response",
+                "request delivered; no reply within the provider deadline. Retrying not attempted: the fault repeats identically.",
+            );
+            self.store.save_task(task)?;
+            return self
+                .store
+                .save_task_blocker(
+                    task.id,
+                    &TaskBlocker::ProviderNotAnswering {
+                        provider_id: self.cloud.id().to_owned(),
+                        model: self.cloud.model().to_owned(),
+                    },
+                )
+                .map(|_| ());
+        }
         if error == Error::Unavailable && task.role != Role::Fast {
             task.status = TaskStatus::Failed;
             // An unreachable provider is not a settings problem, and telling the
